@@ -3,8 +3,10 @@ import type { Plugin } from "vite";
 /**
  * Prepends the copyright banner to every built artifact. The repo's LICENSE
  * covers the source; this covers what people actually copy — the deployed
- * bundle and the standalone files — so every copy carries the notice MIT
- * requires it to keep.
+ * bundle and the standalone files — so every copy carries the license notice
+ * and a pointer to its Corresponding Source, as the AGPL requires, plus the
+ * notice for the MIT-licensed portions the bundles incorporate (Steve Dakh's
+ * contributions, the Emscripten glue — see NOTICE).
  *
  * JS and CSS get a `/*!` legal comment (minifiers preserve those); HTML gets
  * a comment right after the doctype (before it would parse fine in HTML5,
@@ -14,7 +16,9 @@ import type { Plugin } from "vite";
 export function licenseBanner(version: string): Plugin {
   const text =
     `Decimen Optical Transfer v${version} — https://decimen.app — ` +
-    `(c) 2026 Evan Crawley (Bash Alarmist) — SPDX-License-Identifier: MIT`;
+    `(c) 2026 Evan Crawley (Bash Alarmist) — SPDX-License-Identifier: AGPL-3.0-or-later — ` +
+    `portions MIT: (c) 2026 Steve Dakh; Emscripten (see NOTICE) — ` +
+    `Source: https://github.com/bashalarmistalt/decimen-optical-transfer`;
   const comment = `/*! ${text} */\n`;
   const htmlComment = `<!-- ${text} -->`;
   return {

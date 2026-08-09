@@ -14,7 +14,7 @@
 
 import QRCode from "qrcode";
 import { fitQrDisplaySize } from "../shared/display";
-import { rasterizeQr } from "../shared/qr-raster";
+import { gridDims, rasterizeQr } from "../shared/qr-raster";
 import { formatBytes } from "../shared/format";
 import {
   MAX_SOURCE_BLOCKS,
@@ -46,6 +46,10 @@ const LOOKAHEAD = 3;
 // payloads so the app can be left running in front of strangers without
 // handing them a file picker into the host machine.
 const DEMO = import.meta.env.VITE_DEMO === "1";
+// `npm run benchmark` (vite --mode benchmark). Same shape as demo mode but
+// locked to the canonical 1 MB benchmark payload, so every record run
+// transfers the exact bytes the promotion gate pins (build/benchmarks.ts).
+const BENCHMARK = import.meta.env.VITE_BENCHMARK === "1";
 
 const canvas = document.getElementById("qr") as HTMLCanvasElement;
 const stage = document.getElementById("stage") as HTMLDivElement;
@@ -77,6 +81,7 @@ const openShareDialog = wireShareDialog();
 const cfgFps = document.getElementById("cfg-fps") as HTMLSelectElement;
 const cfgBytes = document.getElementById("cfg-bytes") as HTMLSelectElement;
 const cfgEcc = document.getElementById("cfg-ecc") as HTMLSelectElement;
+const cfgGrid = document.getElementById("cfg-grid") as HTMLSelectElement;
 const cfgSize = document.getElementById("cfg-size") as HTMLInputElement;
 
 let selectedFile: {
@@ -171,12 +176,12 @@ function applyMode(): void {
   stage.hidden = true;
   showStreamPanels(false);
 
-  if (DEMO) {
+  if (DEMO || BENCHMARK) {
     modePicker.hidden = true;
     paneFile.hidden = true;
     paneSnippet.hidden = true;
     paneDemo.hidden = false;
-    setStatus("Choose a demo payload to begin");
+    setStatus(BENCHMARK ? "Send the benchmark payload to begin" : "Choose a demo payload to begin");
     return;
   }
 
@@ -270,10 +275,17 @@ async function main() {
   snippetLabel.textContent = `Text to send · up to ${MAX_SNIPPET_LABEL}`;
 
   document.querySelector('.mode-nav a[href="../send/"]')?.setAttribute("aria-current", "page");
-  if (DEMO) {
+  if (DEMO || BENCHMARK) {
     const current = document.querySelector('.mode-nav a[href="../send/"]');
-    if (current) current.textContent = "Demo";
+    if (current) current.textContent = BENCHMARK ? "Benchmark" : "Demo";
+    const paneLabel = paneDemo.querySelector("span");
+    if (BENCHMARK && paneLabel) paneLabel.textContent = "Benchmark payload";
+    // Benchmark preset: 4 codes (2×2). The announcement records the actual
+    // settings either way; this just makes the canonical rig the default.
+    if (BENCHMARK) cfgGrid.value = "4";
     for (const button of document.querySelectorAll<HTMLButtonElement>("[data-demo]")) {
+      // Benchmark mode shows only the canonical payload; demo mode hides it.
+      button.hidden = BENCHMARK ? !button.hasAttribute("data-benchmark") : button.hasAttribute("data-benchmark");
       button.addEventListener("click", () => void selectDemo(button.dataset.demo!));
     }
   } else {
@@ -293,7 +305,7 @@ async function main() {
   }
   applyMode();
   window.addEventListener("resize", () => resizeDisplay?.());
-  for (const el of [cfgFps, cfgBytes, cfgEcc, cfgSize]) {
+  for (const el of [cfgFps, cfgBytes, cfgEcc, cfgGrid, cfgSize]) {
     el.addEventListener("change", () => void startStream());
   }
   await requestScreenWakeLock();
@@ -324,6 +336,12 @@ async function startStream(revealStage = false) {
   const txFps = Number(cfgFps.value);
   const frameBytes = Number(cfgBytes.value);
   const ecc = cfgEcc.value as "L" | "M" | "Q" | "H";
+  // Grid layouts: 2, 4 or 6 independent fountain frames on screen at once,
+  // tiled as same-version QRs. Same header, same capacity math — each code is
+  // an ordinary frame, so the receiver's fountain needs no notion of "layout".
+  // Cells flip on staggered phases rather than all at once — see tick().
+  const gridCodes = Number(cfgGrid.value) || 1;
+  const { cols: gridCols, rows: gridRows } = gridDims(gridCodes);
   const displayPx = Number(cfgSize.value);
 
   const sessionId = (Math.floor(Math.random() * 0xffff) + 1) & 0xffff;
@@ -359,18 +377,27 @@ async function startStream(revealStage = false) {
   let scale = 1;
   const staging = document.createElement("canvas");
   const queue: ImageData[] = [];
+  // Last painted code per grid position: resizing a canvas clears it (even to
+  // the same dimensions), so a mid-stream resize repaints from here instead of
+  // leaving blank cells until the stagger rotation reaches them again.
+  const cells: (ImageData | null)[] = new Array<ImageData | null>(gridCodes).fill(null);
   let nextSeq = 0;
   stage.hidden = false;
 
   const sizeCanvas = () => {
     const dpr = window.devicePixelRatio || 1;
-    const total = modules + 2 * MARGIN;
-    let cssBudget: number;
+    const cell = modules + 2 * MARGIN;
+    const totalW = cell * gridCols;
+    const totalH = cell * gridRows;
+    let budgetW: number;
+    let budgetH: number;
     if (document.body.classList.contains("qr-full")) {
-      // Tap-to-fullscreen: the whole short viewport edge. The display-size
-      // slider and page chrome are deliberately ignored — the point of the
-      // mode is "as big as this device goes".
-      cssBudget = Math.min(window.innerWidth, window.innerHeight);
+      // Tap-to-fullscreen: the whole viewport. The display-size slider and
+      // page chrome are deliberately ignored — the point of the mode is "as
+      // big as this device goes" — and a non-square grid gets both edges,
+      // so a 1×2 stack can run the full height of a portrait phone screen.
+      budgetW = window.innerWidth;
+      budgetH = window.innerHeight;
     } else {
       const containerWidth =
         stage.parentElement?.getBoundingClientRect().width ?? window.innerWidth;
@@ -380,7 +407,7 @@ async function startStream(revealStage = false) {
         Number.parseFloat(stageStyle.paddingRight) +
         Number.parseFloat(stageStyle.borderLeftWidth) +
         Number.parseFloat(stageStyle.borderRightWidth);
-      cssBudget = fitQrDisplaySize(
+      budgetW = budgetH = fitQrDisplaySize(
         window.innerWidth,
         window.innerHeight,
         containerWidth,
@@ -388,23 +415,50 @@ async function startStream(revealStage = false) {
         horizontalChrome,
       );
     }
-    scale = Math.max(1, Math.floor((cssBudget * dpr) / total));
-    staging.width = total;
-    staging.height = total;
-    canvas.width = total * scale;
-    canvas.height = total * scale;
-    canvas.style.width = `${(total * scale) / dpr}px`;
-    canvas.style.height = `${(total * scale) / dpr}px`;
+    scale = Math.max(1, Math.floor(Math.min((budgetW * dpr) / totalW, (budgetH * dpr) / totalH)));
+    staging.width = totalW;
+    staging.height = totalH;
+    canvas.width = totalW * scale;
+    canvas.height = totalH * scale;
+    // Fill the whole budget: the canvas raster stays at an integer module
+    // scale and CSS stretches the remainder SMOOTHLY — never `pixelated`.
+    // Nearest-neighbor makes adjacent modules differ by a whole device pixel,
+    // and at grid densities (scale 2, ~2 camera px/module) that jitter is the
+    // difference between 4/4 codes decoding and 0/4, measured with zxing on
+    // simulated captures. Uniform slight blur beats jagged module widths.
+    // Stretched by one factor on both axes so the modules stay square.
+    const cssNativeW = (totalW * scale) / dpr;
+    const cssNativeH = (totalH * scale) / dpr;
+    const stretch = Math.max(1, Math.min(budgetW / cssNativeW, budgetH / cssNativeH));
+    canvas.style.width = `${cssNativeW * stretch}px`;
+    canvas.style.height = `${cssNativeH * stretch}px`;
+    canvas.style.imageRendering = "auto";
+    // Both canvases were just cleared by the dimension writes — repaint every
+    // cell the stream has shown so far, so a resize never blanks the grid.
+    const stagingCtx = staging.getContext("2d")!;
+    cells.forEach((img, i) => {
+      if (img) stagingCtx.putImageData(img, (i % gridCols) * cell, Math.floor(i / gridCols) * cell);
+    });
+    const ctx = canvas.getContext("2d")!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(staging, 0, 0, canvas.width, canvas.height);
   };
 
-  const makeFrame = (): ImageData => {
+  const makeCode = (): ReturnType<typeof QRCode.create> => {
     const bytes = packFrame({ ...header, seq: nextSeq }, encoder.encode(nextSeq));
     nextSeq++;
-    const qr = QRCode.create([{ data: bytes, mode: "byte" } as unknown as QRCode.QRCodeSegment], {
+    // Every code carries the same byte length at the same ECC with the same
+    // pinned mask, so once the first one locks the version every later
+    // QRCode.create lands on identical geometry — required for tiling.
+    return QRCode.create([{ data: bytes, mode: "byte" } as unknown as QRCode.QRCodeSegment], {
       errorCorrectionLevel: ecc,
       version,
       maskPattern: 4,
     });
+  };
+
+  const makeCell = (): ImageData => {
+    const qr = makeCode();
     if (version === undefined) {
       version = qr.version;
       modules = qr.modules.size;
@@ -415,9 +469,12 @@ async function startStream(revealStage = false) {
       if (revealStage) scrollStageIntoView();
       // The stream's parameters live at the bottom of Transfer settings, next
       // to the knobs that produced them; the status line stays for prose.
-      spec("spec-fps").textContent = `${txFps} fps`;
-      spec("spec-frame").textContent = `${frameBytes} bytes`;
-      spec("spec-qr").textContent = `V${version} · ECC ${ecc}`;
+      spec("spec-fps").textContent =
+        gridCodes > 1 ? `${txFps} fps × ${gridCodes} codes` : `${txFps} fps`;
+      spec("spec-frame").textContent =
+        gridCodes > 1 ? `${frameBytes} bytes × ${gridCodes}` : `${frameBytes} bytes`;
+      spec("spec-qr").textContent =
+        `V${version}${gridCodes > 1 ? ` ×${gridCodes}` : ""} · ECC ${ecc}`;
       spec("spec-payload").textContent = `${name} · ${formatBytes(fileSize)}`;
       spec("spec-compression").textContent =
         compression === "gzip" ? `gzip → ${formatBytes(transmittedSize)}` : "none";
@@ -433,6 +490,41 @@ async function startStream(revealStage = false) {
       share.textContent = "Share receiver link";
       share.addEventListener("click", openShareDialog);
       specs.append(share);
+      // npm run diagnostics: announce this stream's settings so the server
+      // log can pair them with the receiver's end-of-run report — the
+      // receiver only ever learns k and blockLen from the wire, never the
+      // knobs that produced them. Correlate the two by sessionId. The DEV
+      // guard is load-bearing: import.meta.env.DEV is statically false in
+      // every build, so no static site or standalone file ships this.
+      if (import.meta.env.DEV && import.meta.env.VITE_DIAGNOSTICS === "1") {
+        void fetch("/__diagnostics", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            role: "sender",
+            when: new Date().toISOString(),
+            sessionId,
+            payload: {
+              name,
+              fileBytes: fileSize,
+              containerBytes: payload.length,
+              transmittedBytes: transmittedSize,
+              compression,
+            },
+            settings: {
+              txFps,
+              frameBytes,
+              ecc,
+              gridCodes,
+              layout: `${gridCols}×${gridRows}`,
+              displayPx,
+            },
+            qr: { version, modules },
+            fountain: { k: encoder.k, blockLen },
+            ua: navigator.userAgent,
+          }),
+        }).catch(() => undefined);
+      }
     }
     const raster = rasterizeQr(qr.modules.size, qr.modules.data, MARGIN);
     return new ImageData(new Uint8ClampedArray(raster.pixels.buffer), raster.size, raster.size);
@@ -448,10 +540,11 @@ async function startStream(revealStage = false) {
    * never pays for more than the single frame it just consumed.
    */
   let generatorFailed = false;
-  const pump = (max = LOOKAHEAD) => {
+  const lookahead = LOOKAHEAD * gridCodes;
+  const pump = (max = lookahead) => {
     if (generatorFailed || gen !== generation) return;
     try {
-      for (let n = 0; n < max && queue.length < LOOKAHEAD; n++) queue.push(makeFrame());
+      for (let n = 0; n < max && queue.length < lookahead; n++) queue.push(makeCell());
     } catch (err) {
       // e.g. frame bytes over capacity for the chosen ECC level
       generatorFailed = true;
@@ -460,26 +553,82 @@ async function startStream(revealStage = false) {
   };
   pump();
 
+  // Staggered flips: every cell refreshes at txFps, but cell j flips at phase
+  // j/N of the frame interval instead of all N flipping together. A camera
+  // exposure that straddles a flip therefore catches at most ONE code mid-
+  // transition — the other N−1 sit stable under it. With simultaneous flips
+  // that same exposure lost all N at once. Each flip repaints only its own
+  // cell rectangle; cells align to cell×scale boundaries, so the partial blit
+  // is pixel-exact. (Sub-ticks land on rAF frames, so at high fps × codes
+  // several cells can still flip in one refresh — the stagger degrades toward
+  // the old behavior, never below it. A grid of one IS the old behavior.)
   const interval = 1000 / txFps;
+  const subInterval = interval / gridCodes;
+  let cellCursor = 0;
   let nextAt = performance.now();
+  let lastTickAt = performance.now();
   const tick = (now: number) => {
     // generatorFailed means no frame will ever be produced again, so stop the
     // rAF loop rather than spinning on an empty queue until a settings change.
     if (gen !== generation || generatorFailed) return;
     requestAnimationFrame(tick);
-    if (now < nextAt) return;
-    const img = queue.shift();
-    pump(1);
-    if (!img) {
-      nextAt = now + interval;
-      return;
+    // Stall watchdog. Browsers throttle rAF hard in occluded or unfocused
+    // windows (Firefox especially) — the stream freezes on whatever frame was
+    // up, usually mid-flip and unreadable, and the receiver burns seconds in
+    // full-scan reacquisition that LOOKS like a receiver failure. Diagnosed
+    // from a field run: 6 s of decodeFps 0 at captureFps 60, then instant
+    // recovery when the sender window came back. Nothing can un-throttle the
+    // window; what we can do is tell the user exactly what happened.
+    const sinceLastTick = now - lastTickAt;
+    lastTickAt = now;
+    if (sinceLastTick > 1000) {
+      setStatus(
+        `Stream froze for ${(sinceLastTick / 1000).toFixed(1)} s — this window was hidden or ` +
+          `in the background. Keep it visible and focused; the receiver loses lock when it pauses.`,
+      );
+      if (import.meta.env.DEV && import.meta.env.VITE_DIAGNOSTICS === "1") {
+        void fetch("/__diagnostics", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            role: "sender",
+            event: "stall",
+            when: new Date().toISOString(),
+            sessionId,
+            stallSeconds: Number((sinceLastTick / 1000).toFixed(1)),
+          }),
+        }).catch(() => undefined);
+      }
     }
-    staging.getContext("2d")!.putImageData(img, 0, 0);
-    const ctx = canvas.getContext("2d")!;
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(staging, 0, 0, canvas.width, canvas.height);
-    nextAt += interval;
-    if (now - nextAt > 3 * interval) nextAt = now + interval; // fell behind — don't burst
+    if (now < nextAt) return;
+    // A long stall (hidden tab, GC pause) leaves a backlog no camera ever saw
+    // — restart the cadence instead of bursting it out.
+    if (now - nextAt > interval) nextAt = now;
+    // Flip EVERY cell that has come due, not one per callback: txFps × codes
+    // can exceed the display's refresh rate, so a single vsync may owe
+    // several flips. Cells that land on the same vsync paint together — that
+    // is the display's floor, not a scheduling choice — but deferring them
+    // (one flip per rAF) silently capped per-code fps at refresh ÷ codes and
+    // slowed every multi-code grid down. Bounded: the reset above keeps the
+    // debt under one frame interval, so this bursts at most gridCodes flips.
+    while (now >= nextAt) {
+      const img = queue.shift();
+      pump(1);
+      if (!img) {
+        nextAt = now + subInterval;
+        break;
+      }
+      const cell = modules + 2 * MARGIN;
+      const cx = (cellCursor % gridCols) * cell;
+      const cy = Math.floor(cellCursor / gridCols) * cell;
+      cells[cellCursor] = img;
+      staging.getContext("2d")!.putImageData(img, cx, cy);
+      const ctx = canvas.getContext("2d")!;
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(staging, cx, cy, cell, cell, cx * scale, cy * scale, cell * scale, cell * scale);
+      cellCursor = (cellCursor + 1) % gridCodes;
+      nextAt += subInterval;
+    }
   };
   requestAnimationFrame(tick);
 }

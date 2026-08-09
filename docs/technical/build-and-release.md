@@ -6,6 +6,10 @@
 npm run dev               # https dev server with HMR (self-signed cert)
 npm run serve             # build, then serve the production bundle
 npm run demo              # dev server with VITE_DEMO=1 — sender locked to bundled payloads
+npm run diagnostics       # dev server + per-transfer run reports, saved for benchmark promotion — see diagnostics.md
+npm run benchmark         # diagnostics + sender locked to the canonical 1 MB benchmark payload
+npm run benchmark:promote # declare a captured run a record (updates benchmarks/ + README)
+npm run benchmark:readme  # re-render the README "Measured speed" section from records.json
 npm test                  # golden wire-format vectors and unit tests (node --test via tsx)
 npm run build             # typecheck (app + node configs), hosted site → dist/
 npm run build:standalone  # both self-contained pages → dist-standalone/

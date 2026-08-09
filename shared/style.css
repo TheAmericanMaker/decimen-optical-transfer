@@ -1019,11 +1019,27 @@ details.settings input[type="range"] {
   overflow: hidden;
 }
 
+/* contain, never cover: the decoder reads the FULL camera frame, so a cover
+   crop shows less than the decoder sees — codes decode outside the visible
+   box, which reads as a truncated viewfinder. The receiver syncs the box's
+   aspect-ratio to the negotiated stream, so normally there are no bars and
+   contain is indistinguishable from cover; when max-height clamps the box,
+   contain letterboxes instead of silently cropping. */
 .preview video {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   border-radius: 0;
+}
+
+/* Detection indicators paint over the video; the HUD (z-index: 2) stays on top. */
+.preview .detect-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
 }
 
 .transfer-hud {

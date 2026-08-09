@@ -1,13 +1,13 @@
-// LT (Luby transform) fountain code — the trick that makes a one-way optical
-// channel practical.
+// Systematic-carousel fountain code (wire format v2) — the trick that makes
+// a one-way optical channel practical.
 //
-// The sender emits an endless stream of frames; frame `seq` is the XOR of a
-// pseudorandom subset of the file's blocks, with both the subset size
-// (degree, drawn from a robust-soliton distribution) and the block indices
-// derived deterministically from `seq`. The receiver rebuilds the file from
-// ANY ~K·1.15 distinct frames, in any order: a dropped frame costs a little
-// time, never correctness. No back-channel, no retransmission, and sender
-// and receiver frame rates don't need to match at all.
+// The sender emits an endless carousel: a systematic sweep of all K blocks,
+// then K mid-degree repair frames (XORs of pseudorandom block subsets derived
+// deterministically from `seq`), then the next cycle. A receiver locking on
+// anywhere rebuilds the file from ~K distinct frames at low loss — zero
+// fountain overhead — and repair frames patch what loss takes, in any order:
+// a dropped frame costs a little time, never correctness. No back-channel,
+// no retransmission, and sender and receiver frame rates don't need to match.
 //
 // Determinism warning that cost a debugging session: sender and receiver
 // must build bit-identical degree distributions, but JavaScript's Math.log
@@ -127,6 +127,55 @@ export function frameIndices(
   return [...set];
 }
 
+/** Frames per carousel cycle: one systematic sweep of all k blocks, then k
+ *  repair frames for whatever the sweep dropped. */
+export function cycleLength(k: number): number {
+  return 2 * k;
+}
+
+const REPAIR_DEGREE_MIN = 4;
+const REPAIR_DEGREE_MAX = 24;
+
+/**
+ * Repair frames are uniform mid-degree (4–24), NOT robust-soliton. After a
+ * sweep the receiver holds most blocks, so a repair frame's effective degree
+ * is what remains after XORing the solved ones out — soliton's heavy degree-
+ * 1/2 mass just re-sends blocks the sweep already delivered. Measured worst
+ * wall-clock (seqs/k, k=179, 20 trials) against sweep + k/2 soliton:
+ *
+ *     drop            0%    5%    10%   30%   50%
+ *     k/2 soliton    1.00  2.31  2.60  3.71  5.40
+ *     k uniform4-24  1.00  1.37  1.59  2.11  3.06   ← plain LT: 1.14 at 0%
+ */
+function repairIndices(k: number, sessionId: number, seq: number): number[] {
+  const rnd = splitmix32(frameSeed(sessionId, seq));
+  const d = Math.min(k, REPAIR_DEGREE_MIN + (rnd() % (REPAIR_DEGREE_MAX - REPAIR_DEGREE_MIN + 1)));
+  const set = new Set<number>();
+  while (set.size < d) set.add(rnd() % k);
+  return [...set];
+}
+
+/**
+ * Block subset for frame `seq`: systematic during the sweep, mid-degree
+ * repair after. There is no handshake, and none is needed — the carousel
+ * repeats forever, so a receiver locking on anywhere in the cycle takes
+ * systematic frames whenever their block is still unsolved, and repair
+ * frames from ANY cycle patch the sweep's losses. At low loss a receiver
+ * that catches a whole sweep completes in exactly k frames — zero fountain
+ * overhead.
+ *
+ * Repair frames seed from the ABSOLUTE seq, so every cycle's repair frames
+ * draw different subsets — re-watching the carousel never replays them.
+ *
+ * This is wire format v2 (frame header magic 0x0D). The v1 soliton stream
+ * (frameIndices, solitonCdf, dlog) is kept above, pinned by its golden
+ * vectors, in case a future format wants it back — it is no longer emitted.
+ */
+export function frameComposition(k: number, sessionId: number, seq: number): number[] {
+  const pos = seq % cycleLength(k);
+  return pos < k ? [pos] : repairIndices(k, sessionId, seq);
+}
+
 function xorInto(dst: Uint32Array, src: Uint32Array): void {
   for (let i = 0; i < dst.length; i++) dst[i] = (dst[i]! ^ src[i]!) >>> 0;
 }
@@ -135,7 +184,6 @@ export class LTEncoder {
   readonly k: number;
   private readonly words: number;
   private readonly blocks: Uint32Array;
-  private readonly cdf: Float64Array;
 
   constructor(
     payload: Uint8Array,
@@ -150,11 +198,10 @@ export class LTEncoder {
       const src = payload.subarray(b * blockLen, Math.min((b + 1) * blockLen, payload.length));
       bytes.set(src, b * this.words * 4);
     }
-    this.cdf = solitonCdf(this.k);
   }
 
   encode(seq: number): Uint8Array {
-    const idx = frameIndices(this.k, this.cdf, this.sessionId, seq);
+    const idx = frameComposition(this.k, this.sessionId, seq);
     const out = new Uint32Array(this.words);
     for (const b of idx) {
       const off = b * this.words;
@@ -171,13 +218,18 @@ interface PendingFrame {
 
 export class LTDecoder {
   private readonly words: number;
-  private readonly cdf: Float64Array;
   private readonly solved: (Uint32Array | null)[];
   private readonly byBlock = new Map<number, Set<PendingFrame>>();
   private readonly seen = new Set<number>();
   solvedCount = 0;
   framesNew = 0;
   framesDup = 0;
+  /** Frames with a NEW seq that carried no new information — every block
+   *  they cover was already solved. Rare at high catch rates, but a lossy
+   *  multi-code receiver sees the carousel re-sweep blocks it has, and a
+   *  progress bar fed raw framesNew inflates by exactly that fraction
+   *  (measured 96% shown vs ~50% real on a 30%-catch 4-code run). */
+  framesRedundant = 0;
 
   constructor(
     readonly k: number,
@@ -186,7 +238,6 @@ export class LTDecoder {
     readonly totalLen: number,
   ) {
     this.words = Math.ceil(blockLen / 4);
-    this.cdf = solitonCdf(k);
     this.solved = new Array<Uint32Array | null>(k).fill(null);
   }
 
@@ -203,7 +254,7 @@ export class LTDecoder {
     this.framesNew++;
     if (this.isComplete) return;
 
-    const idx = new Set(frameIndices(this.k, this.cdf, this.sessionId, seq));
+    const idx = new Set(frameComposition(this.k, this.sessionId, seq));
     const words = new Uint32Array(this.words);
     new Uint8Array(words.buffer).set(block.subarray(0, this.blockLen));
     for (const b of [...idx]) {
@@ -213,7 +264,10 @@ export class LTDecoder {
         idx.delete(b);
       }
     }
-    if (idx.size === 0) return; // fully redundant
+    if (idx.size === 0) {
+      this.framesRedundant++;
+      return;
+    }
     if (idx.size === 1) {
       this.resolve(idx.values().next().value!, words);
       return;

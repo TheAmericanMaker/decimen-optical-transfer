@@ -19,7 +19,12 @@ import {
 } from "../shared/progress";
 import { createDecodeWorker } from "./worker-factory";
 import { NoSignalHintTimer } from "../shared/no-signal";
-import { DecodeWorkerPool } from "../shared/worker-pool";
+import {
+  DecodeWorkerPool,
+  type SymbolBox,
+  type SymbolInfo,
+  type SymbolQuad,
+} from "../shared/worker-pool";
 import { isSnippet, snippetText } from "../shared/snippet";
 import {
   fnv1a,
@@ -38,6 +43,8 @@ import { closeOnBackdropClick } from "../shared/dialog";
 const startBtn = document.getElementById("start") as HTMLButtonElement;
 const video = document.getElementById("video") as HTMLVideoElement;
 const preview = document.getElementById("preview")!;
+const cameraBox = document.querySelector<HTMLDivElement>(".preview")!;
+const overlay = document.getElementById("detect-overlay") as HTMLCanvasElement;
 const stats = document.getElementById("stats")!;
 const progressEl = document.getElementById("progress")!;
 const bar = document.getElementById("bar")!;
@@ -72,6 +79,7 @@ const STATS_WINDOW_MS = 2000;
 let stream: MediaStream | null = null;
 let decoder: LTDecoder | null = null;
 let streamKey = "";
+let reportSessionId = 0; // pairs this run with the sender's diagnostics post
 let startTs = 0;
 let captureGen = 0;
 let done = false;
@@ -79,15 +87,270 @@ let settingsWired = false;
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 
 const noSignal = new NoSignalHintTimer(NO_SIGNAL_FIRST_MS, NO_SIGNAL_DISMISSED_MS);
-const pool = new DecodeWorkerPool(createDecodeWorker, (bytes) => onDecoded(bytes));
+const pool = new DecodeWorkerPool(
+  createDecodeWorker,
+  (bytes, box, info) => onDecoded(bytes, box, info),
+  // A sighting is a detected-but-undecoded code: no bytes, but a position.
+  // Heavily gated in noteRegion (refresh-only on matches, size-checked on
+  // creation) because failed quads are often junk — but a plausible one lets
+  // the crop path go decode what the full frame could not.
+  (box) => noteRegion(box, performance.now(), false),
+  () => trackedAttempts++,
+);
 const captureTimes: number[] = [];
 const decodeTimes: number[] = [];
+
+// Run-level totals for the diagnostics report (npm run diagnostics). The
+// captureTimes/decodeTimes windows above are pruned for the live fps metrics
+// and cannot answer "how much, in total, did this run do".
+let totalCaptures = 0;
+let totalDecodes = 0;
+let fullScans = 0;
+let peakRegions = 0;
+let capturesDropped = 0; // pool full — frame never even submitted
+let cropsSubmitted = 0;
+let trackedDecodes = 0; // decodes via the fork's detection-skipping fast path
+let trackedAttempts = 0; // crops that TRIED the fast path — hits/attempts is
+// the fork's real hit rate; zero attempts means the quad/dim plumbing broke
+let cameraStartedTs = 0; // acquisition latency = first decode − camera start
+let zeroRegionMs = 0; // transfer time spent with tracking fully collapsed
+let degradedMs = 0; // transfer time spent below the expected code count
+let minSeq = Infinity; // seq span ≈ what the sender emitted while we watched;
+let maxSeq = -1; //        framesNew / span is the fraction we actually caught
+// One sample per stats tick (500 ms): elapsed s, framesNew, solved blocks,
+// live regions, capture fps, decode fps. The shape of a bad run — where it
+// stalled, when tracking collapsed — is invisible in run totals.
+const timeline: number[][] = [];
+const TIMELINE_MAX_SAMPLES = 1200; // 10 min — past that the tail tells nothing new
+
+// Per-code crop tracking. The scene is static (both devices propped), so once
+// a code has been seen its next frames are decoded from a padded crop around
+// its last position: one code per crop means no finder-pattern confusion
+// between neighbors, far fewer pixels per decode, and the crops parallelize
+// across the worker pool. A periodic full-frame scan (re)acquires anything
+// the crops lose — nothing here can get permanently stuck.
+interface Region extends SymbolBox {
+  seen: number;
+  /** True once bytes have actually decoded here. Sighting-only regions are
+   *  probationary: they get crops, but they are not drawn, not counted
+   *  toward the expected code total, and evicted first. */
+  decoded: boolean;
+  /** How far the code moved between its last two decodes, in capture px —
+   *  a handheld receiver's crops must lead the target, not chase it. */
+  drift?: number;
+  /** Corner quad + module count of the last decode here — the tracked fast
+   *  path in the worker rebuilds its sampling transform from these and skips
+   *  detection entirely. Only ever set from real decodes. */
+  quad?: SymbolQuad;
+  dim?: number;
+}
+const regions: Region[] = [];
+// Tried and reverted: a longer TTL for regions with a decode track record
+// (6 s after 5 hits). It measured WORSE — a stale region squats on crop
+// slots at a dead position, and by keeping regions.length looking healthy it
+// suppresses the degraded rescan cadence exactly when reacquisition is
+// needed. Expiring fast and rescanning hard wins.
+const REGION_TTL_MS = 1500;
+const FULL_SCAN_INTERVAL_MS = 1500;
+// A grid sender shows several codes; when fewer regions are live than the
+// stream has shown simultaneously, one of them is MISSING — glare, focus, a
+// borderline density. Crops can't find it (they only look where codes were),
+// so rescan the whole frame hard until it's back. The relaxed cadence would
+// leave a missing code dark for 1.5 s at a time, which on a 2-code stream
+// halves throughput and single-threads the fountain's systematic sweep.
+const FULL_SCAN_DEGRADED_MS = 250;
+// With no lock at all the receiver used to full-scan EVERY capture — sixty
+// 1.2 MP tryHarder decodes per second for the whole aiming phase, the app's
+// hottest loop (fullScans regularly passed 100 before the first timeline
+// sample). Ten per second keeps acquisition feeling instant — ≤100 ms added
+// to first lock — and cuts the aiming burn ~85%.
+const ACQUISITION_SCAN_MS = 100;
+// The high-water mark ages out: a sender restarted with a smaller layout
+// would otherwise keep this receiver rescanning for codes that no longer
+// exist until the transfer ends.
+const EXPECTED_REGIONS_DECAY_MS = 10_000;
+const REGION_PAD = 0.35;
+const MAX_REGIONS = 9;
+let lastFullScan = 0;
+let cropRotate = 0;
+let expectedRegions = 0;
+let expectedRegionsAt = 0;
+
+function decodedCount(): number {
+  let n = 0;
+  for (const r of regions) if (r.decoded) n++;
+  return n;
+}
+
+function noteRegion(box: SymbolBox, now: number, decoded = true, info?: SymbolInfo): void {
+  for (const r of regions) {
+    const dx = Math.abs(box.x + box.w / 2 - (r.x + r.w / 2));
+    const dy = Math.abs(box.y + box.h / 2 - (r.y + r.h / 2));
+    if (dx < Math.max(box.w, r.w) / 2 && dy < Math.max(box.h, r.h) / 2) {
+      if (!decoded) {
+        // A sighting is an eyewitness report, not a measurement: enough to
+        // keep the region alive, never enough to move or resize it. zxing's
+        // failed quads are routinely clipped or wildly mis-sized, and one
+        // overwriting a decode-proven box aims every following crop at
+        // garbage — a measured 6× throughput collapse on a 4-code grid.
+        r.seen = now;
+        return;
+      }
+      // Half-life blend of per-decode displacement: steady hands decay it to
+      // zero, a moving hand keeps the crop padding wide (see captureFrame).
+      r.drift = 0.5 * (r.drift ?? 0) + 0.5 * Math.hypot(dx, dy);
+      Object.assign(r, box, { seen: now });
+      r.decoded = true;
+      if (info?.quad) r.quad = info.quad;
+      if (info?.modules) r.dim = info.modules;
+      return;
+    }
+  }
+  if (!decoded) {
+    // A sighting may only FOUND a region when it looks like the codes this
+    // stream already decodes: grid codes are same-version and same-size on
+    // screen, so a quad far off a decode-proven code's size is detector
+    // noise. With nothing decoded yet there is no yardstick — full scans own
+    // acquisition then, and phantom regions would only starve them.
+    const reference = regions.find((r) => r.decoded);
+    if (!reference) return;
+    const ratio = Math.max(box.w, box.h) / Math.max(reference.w, reference.h);
+    if (ratio < 0.5 || ratio > 2) return;
+  }
+  regions.push({ ...box, seen: now, decoded, quad: info?.quad, dim: info?.modules });
+  if (regions.length > MAX_REGIONS) {
+    regions.sort((a, b) => Number(b.decoded) - Number(a.decoded) || b.seen - a.seen);
+    regions.length = MAX_REGIONS;
+  }
+}
+
+/** The stylesheet guesses 4:3 for the camera box, but cameras rarely negotiate
+ *  exactly that, and any mismatch used to be swallowed by object-fit: cover
+ *  silently cropping — codes the decoder could see sat outside the visible
+ *  preview. Sync the box to the stream's real shape instead; with the aspect
+ *  matched, contain shows every pixel the decoder gets, edge to edge. */
+function syncPreviewAspect() {
+  if (video.videoWidth && video.videoHeight) {
+    cameraBox.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+  }
+}
+// Fires whenever the intrinsic size changes — device rotation, or a live
+// capture-width change the camera accepted.
+video.addEventListener("resize", syncPreviewAspect);
+
+// Viewfinder corner brackets around each code the decoder is tracking, fading
+// out once a region stops producing decodes. Long before REGION_TTL_MS: the
+// brackets answer "is it reading THIS code right now", so they should die as
+// soon as the answer stops being yes, while the crop tracker keeps trying.
+const INDICATOR_FADE_MS = 700;
+const overlayCtx = overlay.getContext("2d")!;
+// One vivid color per code so a multi-code stream reads at a glance — "the
+// amber one isn't decoding" beats counting brackets. Assigned by layout order
+// (top-to-bottom, left-to-right), so a code keeps its color across dropouts
+// and reacquisitions instead of shuffling on every region churn.
+const INDICATOR_COLORS = [
+  "#42e8ff", // cyan
+  "#54ff7e", // green
+  "#ffd94a", // amber
+  "#ff6ad5", // pink
+  "#c08bff", // violet
+  "#ff9a4d", // orange
+  "#8dff4a", // lime
+  "#ff5f5f", // coral
+  "#ffffff", // white
+];
+
+/** Grid-layout reading order: rows first, columns within a row. Two boxes are
+ *  the same row when their vertical centers are within half a code of each
+ *  other — grid codes are same-size and aligned, so this is unambiguous. */
+function layoutOrder(a: Region, b: Region): number {
+  const dy = a.y + a.h / 2 - (b.y + b.h / 2);
+  if (Math.abs(dy) > Math.max(a.h, b.h) / 2) return dy;
+  return a.x + a.w / 2 - (b.x + b.w / 2);
+}
+
+function drawOverlay(now: number) {
+  const cw = overlay.clientWidth;
+  const ch = overlay.clientHeight;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!cw || !ch || !vw || !vh) return;
+  const dpr = window.devicePixelRatio || 1;
+  const pw = Math.round(cw * dpr);
+  const ph = Math.round(ch * dpr);
+  if (overlay.width !== pw || overlay.height !== ph) {
+    overlay.width = pw;
+    overlay.height = ph;
+  }
+  overlayCtx.clearRect(0, 0, pw, ph);
+  // Regions live in capture pixels; the video sits object-fit: contain inside
+  // the same box as the overlay, so one letterbox mapping places everything.
+  const scale = Math.min(pw / vw, ph / vh);
+  const offX = (pw - vw * scale) / 2;
+  const offY = (ph - vh * scale) / 2;
+  overlayCtx.lineWidth = Math.max(2, 2 * dpr);
+  overlayCtx.lineCap = "round";
+  overlayCtx.lineJoin = "round";
+  // Brackets are for codes this stream has actually read — probationary
+  // sighting regions stay invisible, or every stray failed quad would paint
+  // a phantom box.
+  const ordered = regions.filter((r) => r.decoded).sort(layoutOrder);
+  for (const [slot, r] of ordered.entries()) {
+    const age = now - r.seen;
+    if (age > INDICATOR_FADE_MS) continue;
+    const color = INDICATOR_COLORS[slot % INDICATOR_COLORS.length]!;
+    overlayCtx.strokeStyle = color;
+    overlayCtx.shadowColor = color;
+    overlayCtx.shadowBlur = 4 * dpr;
+    // Brackets sit just outside the code so they never cover its modules.
+    const pad = 0.06 * Math.max(r.w, r.h) * scale;
+    const x = offX + r.x * scale - pad;
+    const y = offY + r.y * scale - pad;
+    const w = r.w * scale + 2 * pad;
+    const h = r.h * scale + 2 * pad;
+    const len = 0.24 * Math.min(w, h);
+    overlayCtx.globalAlpha = 1 - age / INDICATOR_FADE_MS;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(x, y + len);
+    overlayCtx.lineTo(x, y);
+    overlayCtx.lineTo(x + len, y);
+    overlayCtx.moveTo(x + w - len, y);
+    overlayCtx.lineTo(x + w, y);
+    overlayCtx.lineTo(x + w, y + len);
+    overlayCtx.moveTo(x + w, y + h - len);
+    overlayCtx.lineTo(x + w, y + h);
+    overlayCtx.lineTo(x + w - len, y + h);
+    overlayCtx.moveTo(x + len, y + h);
+    overlayCtx.lineTo(x, y + h);
+    overlayCtx.lineTo(x, y + h - len);
+    overlayCtx.stroke();
+  }
+  overlayCtx.globalAlpha = 1;
+  overlayCtx.shadowBlur = 0;
+}
 startBtn.onclick = () => void start();
 
 // The header nav markup is shared verbatim between both tool pages; each page
 // marks its own link. Optional because the standalone build swaps the nav for
 // a badge. Same story on the sender.
 document.querySelector('.mode-nav a[href="../receive/"]')?.setAttribute("aria-current", "page");
+
+// More decode workers than the device has cores just adds contention —
+// counts the device can't use are removed outright rather than grayed out:
+// a dead option is noise here, not information.
+if (navigator.hardwareConcurrency) {
+  for (const option of Array.from(cfgWorkers.options)) {
+    if (Number(option.value) > navigator.hardwareConcurrency) option.remove();
+  }
+}
+// Default to everything the device offers. Workers got cheap (the Decimen
+// zxing build is 258 KB per instance, and tracked decoding cut per-decode
+// CPU), and controlled runs showed the pool as the safety margin, not the
+// risk — a 60 fps stream now decodes at capture rate when the pool is ahead
+// of it. An explicit selection (change event) sticks for the session.
+cfgWorkers.value = String(
+  Math.max(...Array.from(cfgWorkers.options, (option) => Number(option.value))),
+);
 
 const { setStatus, showError } = statusLine(stats);
 
@@ -196,6 +459,7 @@ async function start() {
   if (diagnosticsEl) diagnosticsEl.style.display = "block";
   video.srcObject = stream;
   await video.play().catch(() => undefined);
+  syncPreviewAspect();
   const settings = stream.getVideoTracks()[0]?.getSettings();
   setStatus(
     `camera ${settings?.width}×${settings?.height}@${settings?.frameRate} — searching for a stream…`,
@@ -212,6 +476,7 @@ async function start() {
   }
 
   noSignal.cameraStarted(performance.now());
+  cameraStartedTs = performance.now();
   captureGen++;
   scheduleFrame(captureGen);
   statsTimer = setInterval(updateStats, 500);
@@ -248,6 +513,11 @@ async function applyCameraExtras() {
       option.disabled = Number(option.value) > caps.maxFrameRate;
     }
   }
+  if (caps.maxWidth) {
+    for (const option of Array.from(cfgWidth.options)) {
+      option.disabled = Number(option.value) > caps.maxWidth;
+    }
+  }
 }
 
 async function applyReceiveSettings() {
@@ -280,6 +550,7 @@ function scheduleFrame(gen: number) {
   const next = () => {
     if (done || gen !== captureGen) return;
     captureFrame();
+    drawOverlay(performance.now());
     scheduleFrame(gen);
   };
   if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(next);
@@ -289,24 +560,171 @@ function scheduleFrame(gen: number) {
 const grab = document.createElement("canvas");
 let frameId = 0;
 
+// GPU-side capture: createImageBitmap(video, crop) hands each worker a
+// transferable bitmap with NO main-thread pixel readback — the worker draws
+// it onto an OffscreenCanvas and reads pixels on its own thread. On paper
+// this moves ~60 MB/s of GPU→CPU copies off the main thread and
+// parallelizes them across the pool.
+//
+// MEASURED 4× SLOWER on iOS (iPhone, Safari 26): 38% of captures dropped
+// pool-busy (vs ~0.5%) and the tracked hit rate halved — Safari's worker-
+// side OffscreenCanvas readback is far slower than the main-thread one, and
+// its video→bitmap conversion yields subtly different pixels. Opt-in only
+// (?capture=bitmap), kept because other engines may genuinely benefit.
+const BITMAP_CAPTURE =
+  new URLSearchParams(window.location.search).get("capture") === "bitmap" &&
+  typeof createImageBitmap === "function" &&
+  typeof OffscreenCanvas !== "undefined";
+
+/** Fire-and-forget submit of a GPU-cropped frame. The bitmap resolves async;
+ *  by then the pool may have filled or the transfer ended — close it rather
+ *  than leak GPU memory. */
+function submitBitmap(
+  pending: Promise<ImageBitmap>,
+  meta: { ox: number; oy: number; full: boolean; quad?: SymbolQuad; dim?: number },
+): void {
+  void pending
+    .then((bitmap) => {
+      const taken =
+        !done && pool.submit({ id: frameId++, bitmap, ...meta }, [bitmap]);
+      if (!taken) bitmap.close();
+      else if (!meta.full) cropsSubmitted++;
+    })
+    .catch(() => undefined);
+}
+
+// The stripe-signature dup-skip that used to live here is gone: field runs
+// showed screen captures defeat it (sensor noise plus refresh-phase shimmer
+// shift the stripe between two captures of the SAME displayed frame — 452
+// duplicate decodes leaked through in one 30 fps run), and it was the last
+// thing requiring main-thread pixel access. Duplicates now cost one cheap
+// tracked decode each, which the pool absorbs without noticing.
+
 function captureFrame() {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   if (!vw || !vh) return;
-  captureTimes.push(performance.now());
-  if (pool.busyCount === pool.size) return; // all busy — drop it, no harm done
+  const now = performance.now();
+  captureTimes.push(now);
+  totalCaptures++;
+  if (pool.busyCount === pool.size) {
+    capturesDropped++;
+    return; // all busy — drop it, no harm done
+  }
+
+  for (let i = regions.length - 1; i >= 0; i--) {
+    if (now - regions[i]!.seen > REGION_TTL_MS) regions.splice(i, 1);
+  }
+  // Only decode-proven regions count toward "how many codes does this stream
+  // show" — phantom sighting regions once inflated the total and locked the
+  // receiver into a permanent 250 ms rescan storm. peakRegions is reported as
+  // the stream's code count, so it counts proven regions for the same reason.
+  const live = decodedCount();
+  peakRegions = Math.max(peakRegions, live);
+  if (live >= expectedRegions || now - expectedRegionsAt > EXPECTED_REGIONS_DECAY_MS) {
+    expectedRegions = live;
+    expectedRegionsAt = now;
+  }
+  const scanInterval =
+    live === 0
+      ? ACQUISITION_SCAN_MS
+      : live < expectedRegions
+        ? FULL_SCAN_DEGRADED_MS
+        : FULL_SCAN_INTERVAL_MS;
+  // A due full scan takes priority over crops, deliberately. The crop loop
+  // below fills every free worker slot each frame, so any "only scan when a
+  // slot is spare" politeness starves the rescan that reacquires a missing
+  // code — tried, and it measurably worsened multi-code lock-on. Scans are
+  // rare (1.5 s healthy, 250 ms degraded, 100 ms cold); crops keep the slot
+  // next frame — including crops of probationary sighting regions, which now
+  // run between cold scans instead of being crowded out by them.
+  const fullScanDue = now - lastFullScan > scanInterval;
+
+  if (BITMAP_CAPTURE) {
+    if (fullScanDue) {
+      lastFullScan = now;
+      fullScans++;
+      submitBitmap(createImageBitmap(video), { ox: 0, oy: 0, full: true });
+      return;
+    }
+    // The bitmaps resolve async, so "stop when the pool refuses" becomes
+    // "create no more than the free slots seen now" — submitBitmap closes
+    // any bitmap that loses the race anyway.
+    let free = pool.size - pool.busyCount;
+    for (let i = 0; i < regions.length && free > 0; i++) {
+      const r = regions[(i + cropRotate) % regions.length]!;
+      const size = Math.max(r.w, r.h);
+      const pad = Math.round(size * REGION_PAD + Math.min(size, 2 * (r.drift ?? 0)));
+      const x = Math.max(0, Math.floor(r.x - pad));
+      const y = Math.max(0, Math.floor(r.y - pad));
+      const w = Math.min(vw - x, Math.ceil(r.w + 2 * pad));
+      const h = Math.min(vh - y, Math.ceil(r.h + 2 * pad));
+      if (w < 32 || h < 32) continue;
+      free--;
+      submitBitmap(createImageBitmap(video, x, y, w, h), {
+        ox: x,
+        oy: y,
+        full: false,
+        quad: r.quad,
+        dim: r.dim,
+      });
+    }
+    cropRotate++;
+    return;
+  }
+
+  // ---- Readback fallback: browsers without createImageBitmap/OffscreenCanvas.
   if (grab.width !== vw || grab.height !== vh) {
     grab.width = vw;
     grab.height = vh;
   }
   const ctx = grab.getContext("2d", { willReadFrequently: true })!;
   ctx.drawImage(video, 0, 0);
-  const img = ctx.getImageData(0, 0, vw, vh);
-  pool.submit({ id: frameId++, buf: img.data.buffer, w: vw, h: vh }, [img.data.buffer]);
+  if (fullScanDue) {
+    lastFullScan = now;
+    fullScans++;
+    const img = ctx.getImageData(0, 0, vw, vh);
+    pool.submit(
+      { id: frameId++, buf: img.data.buffer, w: vw, h: vh, ox: 0, oy: 0, full: true },
+      [img.data.buffer],
+    );
+    return;
+  }
+  // One crop per known code, rotated so a short worker pool doesn't starve
+  // the same tail region every frame. Submitting stops when the pool is full;
+  // the fountain absorbs whatever gets dropped.
+  for (let i = 0; i < regions.length; i++) {
+    const r = regions[(i + cropRotate) % regions.length]!;
+    // The pad leads a moving target: base margin plus twice the displacement
+    // observed between the region's last decodes, so a handheld receiver's
+    // crops keep containing the code instead of chasing where it was. Capped
+    // at one code size — past that the crop approaches frame-sized anyway.
+    const size = Math.max(r.w, r.h);
+    const pad = Math.round(size * REGION_PAD + Math.min(size, 2 * (r.drift ?? 0)));
+    const x = Math.max(0, Math.floor(r.x - pad));
+    const y = Math.max(0, Math.floor(r.y - pad));
+    const w = Math.min(vw - x, Math.ceil(r.w + 2 * pad));
+    const h = Math.min(vh - y, Math.ceil(r.h + 2 * pad));
+    if (w < 32 || h < 32) continue;
+    const img = ctx.getImageData(x, y, w, h);
+    // The quad + dimension arm the worker's tracked fast path (detection
+    // skipped entirely, 2× at V40); absent — or stale after a miss — the
+    // worker falls back to the stock decoder on the same buffer.
+    const taken = pool.submit(
+      { id: frameId++, buf: img.data.buffer, w, h, ox: x, oy: y, full: false, quad: r.quad, dim: r.dim },
+      [img.data.buffer],
+    );
+    if (!taken) break;
+    cropsSubmitted++;
+  }
+  cropRotate++;
 }
 
-function onDecoded(bytes: Uint8Array) {
+function onDecoded(bytes: Uint8Array, box?: SymbolBox, info?: SymbolInfo) {
   decodeTimes.push(performance.now());
+  totalDecodes++;
+  if (info?.tracked) trackedDecodes++;
+  if (box) noteRegion(box, performance.now(), true, info);
   const parsed = parseFrame(bytes);
   if (!parsed || done) return;
   const { header, block } = parsed;
@@ -321,10 +739,13 @@ function onDecoded(bytes: Uint8Array) {
   if (!decoder || streamKey !== identity) {
     decoder = new LTDecoder(header.k, header.blockLen, header.sessionId, header.totalLen);
     streamKey = identity;
+    reportSessionId = header.sessionId;
     startTs = performance.now();
     progressEl.style.display = "block";
     progressStatus.style.display = "flex";
   }
+  minSeq = Math.min(minSeq, header.seq);
+  maxSeq = Math.max(maxSeq, header.seq);
   decoder.addFrame(header.seq, block);
   updateProgressEstimate();
 
@@ -339,9 +760,16 @@ function onDecoded(bytes: Uint8Array) {
 function updateProgressEstimate() {
   if (!decoder) return;
   const elapsed = Math.max(0, (performance.now() - startTs) / 1000);
+  // Progress runs on frames that carried INFORMATION, not raw arrivals. On a
+  // lossy multi-code run the carousel re-sweeps blocks this receiver already
+  // solved; each re-sweep frame has a fresh seq, so framesNew inflates by the
+  // loss rate — a 30%-catch 4-code run showed 96% on the bar with half the
+  // blocks outstanding, then "finished early". framesRedundant subtracts
+  // exactly those empty arrivals.
+  const usefulFrames = decoder.framesNew - decoder.framesRedundant;
   const estimate = estimateTransferProgress(
     decoder.k,
-    decoder.framesNew,
+    usefulFrames,
     elapsed,
     decoder.solvedCount,
   );
@@ -363,11 +791,12 @@ function updateProgressEstimate() {
 
 /** Payload KB/s, discounting the frames the fountain spends on overhead. That
  *  discount is k-dependent — assuming a flat 1.18 over-reported small transfers
- *  by up to 2×, because a short stream needs far more redundancy per block. */
+ *  by up to 2×, because a short stream needs far more redundancy per block.
+ *  Redundant re-sweep arrivals are excluded outright: they move no payload. */
 function goodputKbs(elapsed: number): number {
   if (!decoder) return 0;
   return (
-    (decoder.framesNew * decoder.blockLen) /
+    ((decoder.framesNew - decoder.framesRedundant) * decoder.blockLen) /
     expectedFountainOverhead(decoder.k) /
     1024 /
     Math.max(0.1, elapsed)
@@ -377,6 +806,88 @@ function goodputKbs(elapsed: number): number {
 async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
   done = true;
   captureGen++;
+  // npm run diagnostics: one JSON report per completed run, POSTed to the dev
+  // server so it lands in the terminal (build/diagnostics-endpoint.ts). Sent
+  // before teardown, while the camera settings and pool size are still real.
+  // The DEV guard is load-bearing: import.meta.env.DEV is statically false in
+  // every build, so this whole branch is compiled out of the static site, the
+  // GitHub Pages deploy, and the standalone files.
+  if (import.meta.env.DEV && import.meta.env.VITE_DIAGNOSTICS === "1") {
+    const track = stream?.getVideoTracks()[0];
+    const camera = track?.getSettings();
+    // What the sender emitted while we watched, by seq range — against the
+    // frames we actually parsed, that is the receiver's catch rate. A low
+    // catch rate means the receiver missed displayed frames (capacity or
+    // tracking); overhead high with a high catch rate blames the fountain.
+    const seqSpan = maxSeq >= minSeq ? maxSeq - minSeq + 1 : 0;
+    const parsed = (decoder?.framesNew ?? 0) + (decoder?.framesDup ?? 0);
+    void fetch("/__diagnostics", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        role: "receiver",
+        when: new Date().toISOString(),
+        sessionId: reportSessionId,
+        ok: hashOk,
+        seconds: Number(seconds.toFixed(2)),
+        acquisitionSeconds: cameraStartedTs
+          ? Number(((startTs - cameraStartedTs) / 1000).toFixed(2))
+          : null,
+        payloadBytes: container.length,
+        // The container's embedded file digest (packFile writes it at byte
+        // 17) — benchmark promotion pins the canonical payload against this.
+        payloadSha256: [...container.slice(17, 49)]
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join(""),
+        goodputKBs: Number((container.length / 1024 / Math.max(0.01, seconds)).toFixed(1)),
+        fountain: {
+          k: decoder?.k,
+          blockLen: decoder?.blockLen,
+          framesNew: decoder?.framesNew,
+          framesDup: decoder?.framesDup,
+          framesRedundant: decoder?.framesRedundant,
+          overhead: decoder ? Number((decoder.framesNew / decoder.k).toFixed(2)) : null,
+          usefulOverhead: decoder
+            ? Number(((decoder.framesNew - decoder.framesRedundant) / decoder.k).toFixed(2))
+            : null,
+          seqSpan,
+          catchRate: seqSpan ? Number((parsed / seqSpan).toFixed(3)) : null,
+        },
+        codes: peakRegions,
+        pipeline: {
+          captureMode: BITMAP_CAPTURE ? "bitmap" : "readback",
+          captures: totalCaptures,
+          capturesDroppedPoolBusy: capturesDropped,
+          cropsSubmitted,
+          fullScans,
+          decodes: totalDecodes,
+          trackedAttempts,
+          trackedDecodes,
+          zeroRegionMs,
+          degradedMs,
+        },
+        workers: pool.size,
+        requested: {
+          width: Number(cfgWidth.value),
+          fps: Number(cfgCapFps.value),
+          workers: Number(cfgWorkers.value),
+        },
+        camera: camera
+          ? {
+              width: camera.width,
+              height: camera.height,
+              fps: camera.frameRate,
+              facingMode: camera.facingMode ?? null,
+            }
+          : null,
+        cameraCapabilities: track ? probeCameraCapabilities(track) : null,
+        device: { cores: navigator.hardwareConcurrency ?? null, ua: navigator.userAgent },
+        timelineKey:
+          "seconds, framesNew, solvedBlocks, decodedRegions, trackedRegions, captureFps, decodeFps, fullScansCumulative",
+        timeline,
+      }),
+    }).catch(() => undefined);
+  }
   // Tear the whole capture pipeline down: the camera, the stats timer, and the
   // decode pool. Each worker holds its own ~940 KB zxing WASM instance, which
   // is worth reclaiming on a phone the moment the last frame is in.
@@ -612,6 +1123,27 @@ function updateStats() {
   if (noSignal.tick(now)) showNoSignalHint();
   if (!decoder) return;
   const elapsed = (now - startTs) / 1000;
+  // Diagnostics accounting, gated on a running transfer so camera-pointing
+  // time doesn't pollute it. 500 ms granularity matches this timer. Decode-
+  // proven regions are the signal, matching the scheduler: a probationary
+  // sighting region must not mask a missing code (degradedMs) or hide a full
+  // tracking collapse (zeroRegionMs). The timeline carries BOTH counts so
+  // phantom churn stays visible next to the real one.
+  const liveNow = decodedCount();
+  if (liveNow === 0) zeroRegionMs += 500;
+  if (liveNow < expectedRegions) degradedMs += 500;
+  if (timeline.length < TIMELINE_MAX_SAMPLES) {
+    timeline.push([
+      Number(elapsed.toFixed(1)),
+      decoder.framesNew,
+      decoder.solvedCount,
+      liveNow,
+      regions.length,
+      Number(perSecond(captureTimes).toFixed(1)),
+      Number(perSecond(decodeTimes).toFixed(1)),
+      fullScans,
+    ]);
+  }
   updateProgressEstimate();
   metric("m-rate").textContent = `${goodputKbs(elapsed).toFixed(1)} KB/s`;
   metric("m-time").textContent = `${elapsed.toFixed(0)} s`;

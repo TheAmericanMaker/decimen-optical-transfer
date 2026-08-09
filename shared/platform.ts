@@ -35,6 +35,8 @@ export interface CameraCapabilities {
   continuousFocus: boolean;
   /** Highest frame rate the current camera mode reports, when it reports one. */
   maxFrameRate?: number;
+  /** Widest capture the camera reports, when it reports one. */
+  maxWidth?: number;
 }
 
 export function probeCameraCapabilities(track: MediaStreamTrack): CameraCapabilities {
@@ -44,6 +46,7 @@ export function probeCameraCapabilities(track: MediaStreamTrack): CameraCapabili
     torch: caps.torch === true,
     continuousFocus: Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous"),
     maxFrameRate: caps.frameRate?.max,
+    maxWidth: caps.width?.max,
   };
 }
 

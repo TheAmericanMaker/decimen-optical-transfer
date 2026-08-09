@@ -34,8 +34,19 @@ One file each, exact-match string surgery that **throws when it misses** — mar
 - `html-tokens.ts` — `%TOKEN%` substitution (site URL, settings options, version, build id).
 - `root-pwa-head.ts` — owns the manifest link and SW registration on every page; validates the URLs resolve to the site root under any subpath.
 - `rewrite-standalone-links.ts` — strips/rewrites hosted-site references for the single-file builds.
-- `inline-zxing-wasm.ts`, `use-inline-variants.ts` — inline the decoder wasm/worker for standalone.
+- `inline-codec-wasm.ts`, `use-inline-variants.ts` — inline the decoder wasm/worker for standalone.
 - `standalone-csp.ts`, `emit-as.ts` — standalone CSP and output naming.
+- `license-banner.ts` — prepends the version/license/source banner to every built artifact.
+- `diagnostics-endpoint.ts` — dev-only `/__diagnostics` collector behind `npm run diagnostics` (see [Diagnostics](diagnostics.md)).
 - `make-icons.ts` — regenerates `public/` icons from the logo (`npm run icons`, needs librsvg).
+- `benchmarks.ts` — promotes captured diagnostics runs to benchmark records and renders the README "Measured speed" section from `benchmarks/records.json` (see [Diagnostics](diagnostics.md)).
+
+## Vendored decoder (`vendor/decimen-codec/`)
+
+The compiled decode engine — a QR-only zxing-cpp build with a tracked fast
+path, released separately as
+[decimen-codec](https://github.com/bashalarmistalt/decimen-codec). The
+artifacts self-identify (banner + `version()`/`build()` exports); licensing
+in `NOTICE.md` alongside them.
 
 Typechecking: `tsconfig.json` covers the pages and `shared/`; `tsconfig.node.json` covers `build/` and `vite.config.ts` (both run in `npm run build`).

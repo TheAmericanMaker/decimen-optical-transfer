@@ -14,9 +14,44 @@ export interface PoolWorker {
   terminate(): void;
 }
 
+/** Where a symbol sat in the capture, in capture coordinates. */
+export interface SymbolBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** A symbol's corner quad in capture coordinates — the tracked decode path
+ *  rebuilds its sampling transform from this, so unlike the axis-aligned box
+ *  it must survive the round trip un-flattened. */
+export interface SymbolQuad {
+  topLeft: { x: number; y: number };
+  topRight: { x: number; y: number };
+  bottomRight: { x: number; y: number };
+  bottomLeft: { x: number; y: number };
+}
+
+/** Decode metadata that rides along with the bytes. */
+export interface SymbolInfo {
+  quad?: SymbolQuad;
+  /** QR dimension in modules; feeds the next tracked decode. */
+  modules?: number;
+  /** True when the tracked fast path produced this decode. */
+  tracked?: boolean;
+}
+
 interface DecodeMessage {
   id: number;
-  bytes: Uint8Array | null;
+  /** Every QR found in the frame. The grid sender shows several codes at
+   *  once; each one is an independent fountain frame. Empty means a miss. */
+  symbols: { bytes: Uint8Array; box?: SymbolBox; quad?: SymbolQuad; modules?: number; tracked?: boolean }[];
+  /** Codes DETECTED but not decoded — no bytes, but the position is real.
+   *  The receiver uses these to aim crops at codes the full frame lost. */
+  sightings?: SymbolBox[];
+  /** True when this reply's crop went through the tracked fast path first —
+   *  paired with per-symbol `tracked`, the receiver derives the hit rate. */
+  trackedAttempted?: boolean;
 }
 
 export class DecodeWorkerPool {
@@ -25,7 +60,9 @@ export class DecodeWorkerPool {
 
   constructor(
     private readonly create: () => PoolWorker,
-    private readonly onDecoded: (bytes: Uint8Array) => void,
+    private readonly onDecoded: (bytes: Uint8Array, box?: SymbolBox, info?: SymbolInfo) => void,
+    private readonly onSighted?: (box: SymbolBox) => void,
+    private readonly onTrackedAttempt?: () => void,
   ) {}
 
   get size(): number {
@@ -47,10 +84,13 @@ export class DecodeWorkerPool {
       const slot = this.workers.length;
       const worker = this.create();
       worker.onmessage = (event: MessageEvent) => {
-        const { id, bytes } = event.data as DecodeMessage;
+        const { id, symbols, sightings, trackedAttempted } = event.data as DecodeMessage;
         if (id === -1) return; // warm-up ping, no frame attached
         this.busy[slot] = false;
-        if (bytes) this.onDecoded(bytes);
+        if (trackedAttempted) this.onTrackedAttempt?.();
+        for (const s of symbols)
+          this.onDecoded(s.bytes, s.box, { quad: s.quad, modules: s.modules, tracked: s.tracked });
+        if (this.onSighted) for (const box of sightings ?? []) this.onSighted(box);
       };
       this.workers.push(worker);
       this.busy.push(false);

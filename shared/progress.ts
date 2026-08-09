@@ -1,26 +1,16 @@
 /**
- * Distinct frames per source block an LT stream needs, as a function of k.
+ * Distinct frames per source block a stream needs.
  *
- * The often-quoted ~1.15 is asymptotic and only holds for large k. Measured
- * here over 200 trials per k (128-byte blocks, frames fed until the decoder
- * completes):
- *
- *     k       1     5    25    50   100   200   400   800  1600  3200
- *     p50  1.00  1.40  1.44  1.38  1.31  1.26  1.22  1.18  1.15  1.12
- *     p90  1.00  2.20  1.92  1.76  1.52  1.38  1.30  1.24  1.19  1.15
- *
- * `1.1 + 2.45/sqrt(k)` tracks the p50 closely from k≈50 up and sits just above
- * it, which is the direction that matters: an ETA that quotes too little and
- * then keeps slipping reads as a stall. Clamped at both ends — below k≈25 the
- * spread is enormous but the whole transfer is over in a second or two anyway.
- *
- * A 300 KB file at 2953 bytes/frame is only k≈100, so most real transfers sit
- * in the part of this curve where the flat 1.18 this replaced was wrong by
- * 15–40%.
+ * The v1 soliton fountain needed 1.15–1.6 depending on k (see git history for
+ * the measured curve). The v2 systematic carousel (fountain.ts) needs exactly
+ * 1.00 at zero loss — measured p50 AND p90 over 100 trials each at
+ * k ∈ {5, 25, 100, 400, 1600} — because one caught sweep is the whole file.
+ * The 2% margin keeps the bar and the goodput figure from over-promising on
+ * the odd dropped frame; under real loss the ETA's overshoot handling extends
+ * the target instead of this model pretending to know the loss rate.
  */
 export function expectedFountainOverhead(sourceBlocks: number): number {
-  const k = Math.max(1, sourceBlocks);
-  return Math.min(1.6, Math.max(1.15, 1.1 + 2.45 / Math.sqrt(k)));
+  return sourceBlocks <= 1 ? 1 : 1.02;
 }
 
 export interface TransferProgressEstimate {
@@ -57,6 +47,24 @@ export function estimateTransferProgress(
     const extra = (uniqueFrames - expectedFrames) / expectedRedundancy;
     frameFraction = 0.96 + 0.03 * (1 - Math.exp(-extra));
   }
+  // Frames PROMISE; blocks DELIVER. Under loss the carousel's repair half
+  // parks arriving frames as pending without solving anything, so a frames-
+  // only bar runs to "almost done" with half the blocks outstanding (a
+  // 22%-catch 4-code field run showed 96% at 45% solved, then "finished
+  // early"). Once blocks are being solved, the frame baseline may lead them
+  // by at most 12% of the stream — enough to keep the bar moving through a
+  // repair half, never enough to lie. Solved blocks can always advance the
+  // bar on their own (below), and the final peeling cascade closes the gap
+  // at completion. With solvedBlocks still 0 the baseline stays uncapped:
+  // the stream simply hasn't started delivering, and early sweep frames
+  // solve on arrival anyway.
+  if (solvedBlocks > 0) {
+    const lead = 0.12 * minimumFrames;
+    frameFraction = Math.min(
+      frameFraction,
+      0.86 * Math.min(1, (solvedBlocks + lead) / minimumFrames),
+    );
+  }
   const decodedFraction = 0.99 * Math.min(1, solvedBlocks / minimumFrames);
   const fraction = Math.min(0.99, Math.max(frameFraction, decodedFraction));
   const phase = uniqueFrames < minimumFrames ? "collecting" : "decoding";
@@ -65,14 +73,15 @@ export function estimateTransferProgress(
   // Past the expected frame count the stream is running long — poor light,
   // motion blur, a camera that won't hold focus. That is exactly when someone
   // is staring at the bar wondering whether it has stalled, so keep quoting a
-  // time instead of going silent: extend the target one redundancy block at a
-  // time. The estimate steps up when a step is missed, which is honest about
-  // the transfer taking longer than the fountain's nominal overhead predicts.
+  // time instead of going silent: extend the target a tenth of the stream at
+  // a time. (The v2 carousel's nominal redundancy is only 2%, which as a step
+  // size would quote a perpetual "about 1s" — a floor keeps the steps honest.)
   const overshoot = uniqueFrames - expectedFrames;
+  const step = Math.max(expectedRedundancy, Math.ceil(minimumFrames / 10));
   const target =
     overshoot < 0
       ? expectedFrames
-      : expectedFrames + expectedRedundancy * (Math.floor(overshoot / expectedRedundancy) + 1);
+      : expectedFrames + step * (Math.floor(overshoot / step) + 1);
   const etaSeconds =
     uniqueFrames >= 3 && elapsedSeconds >= 1 && rate > 0
       ? (target - uniqueFrames) / rate

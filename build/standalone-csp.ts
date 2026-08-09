@@ -4,10 +4,11 @@ import type { Plugin } from "vite";
  * Lock a standalone page down to exactly what it uses.
  *
  * The point is not XSS — it is making "no network" enforceable instead of
- * merely intended. zxing-wasm ships a default `locateFile` pointing at
- * jsdelivr, and that string is compiled into the receiver even though
- * prepareZXingModule() overrides it. Today nothing reaches it; a library
- * upgrade or a reordered init is all it would take. `default-src 'none'` with
+ * merely intended. Nothing in the current bundle names a network origin (the
+ * decimen-codec glue resolves its wasm relative to the importing script), but
+ * history warns here: the previously bundled zxing-wasm compiled a jsdelivr
+ * URL into the receiver. A dependency change or a reordered init is all it
+ * would take to regress silently. `default-src 'none'` with
  * no http(s) source anywhere means the browser refuses rather than the page
  * quietly phoning home from an air-gapped machine.
  *
