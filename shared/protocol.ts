@@ -4,7 +4,9 @@
 //
 // Layout (little-endian), 20 bytes, followed by `blockLen` payload bytes:
 //   0  u8   magic 0xD1
-//   1  u8   magic 0x0C
+//   1  u8   magic 0x0D — wire format v2: systematic-carousel fountain
+//                        (bumped from 0x0C so v1 senders/receivers reject
+//                        v2 streams cleanly instead of desyncing silently)
 //   2  u16  sessionId   random per sender start
 //   4  u32  seq         drives the fountain PRNG (see fountain.ts)
 //   8  u16  k           source block count
@@ -25,7 +27,7 @@ export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_FILE_LABEL = `${MAX_FILE_BYTES / 1024 / 1024} MB`;
 const FILE_HEADER_LEN = 49;
 const MAGIC0 = 0xd1;
-const MAGIC1 = 0x0c;
+const MAGIC1 = 0x0d; // v2: systematic-carousel fountain (see fountain.ts)
 const FILE_MAGIC = new Uint8Array([0x44, 0x43, 0x46, 0x32]); // DCF2
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();

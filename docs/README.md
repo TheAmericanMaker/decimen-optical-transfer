@@ -15,3 +15,4 @@
 - [Protocol](technical/protocol.md) — fountain coding, frame format, verification.
 - [Platform quirks](technical/platform-quirks.md) — the hard-won iOS/Android/Safari details baked into the code.
 - [Build & release](technical/build-and-release.md) — scripts, build modes, CI, releasing.
+- [Diagnostics](technical/diagnostics.md) — the `npm run diagnostics` run rig: per-transfer reports, what the numbers attribute blame to.

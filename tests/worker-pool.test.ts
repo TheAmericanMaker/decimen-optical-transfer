@@ -17,9 +17,16 @@ class FakeWorker implements PoolWorker {
     this.terminated = true;
   }
 
-  /** Pretend the WASM decoder came back with something (or nothing). */
+  /** Pretend the WASM decoder came back with one symbol (or nothing). */
   reply(bytes: Uint8Array | null, id = 0): void {
-    this.onmessage?.({ data: { id, bytes } } as MessageEvent);
+    this.onmessage?.({ data: { id, symbols: bytes ? [{ bytes }] : [] } } as MessageEvent);
+  }
+
+  /** Grid mode: a frame can come back as several decoded symbols. */
+  replyMany(symbols: Uint8Array[], id = 0): void {
+    this.onmessage?.({
+      data: { id, symbols: symbols.map((bytes) => ({ bytes })) },
+    } as MessageEvent);
   }
 }
 
@@ -131,6 +138,101 @@ test("slots stay bound to their own worker across a shrink and regrow", () => {
   created[3]!.reply(new Uint8Array([2]));
   created[4]!.reply(new Uint8Array([3]));
   assert.equal(pool.busyCount, 0);
+});
+
+test("a multi-symbol reply fans out one decode per symbol and frees the slot once", () => {
+  const { pool, created, decoded } = harness();
+  pool.resize(1);
+  pool.submit(frame(1), []);
+
+  created[0]!.replyMany([new Uint8Array([0xa0]), new Uint8Array([0xa2])]);
+  assert.deepEqual(decoded, [new Uint8Array([0xa0]), new Uint8Array([0xa2])]);
+  assert.equal(pool.busyCount, 0, "one reply frees the slot exactly once");
+
+  // An empty symbol list is a miss: slot freed, nothing handed on.
+  pool.submit(frame(2), []);
+  created[0]!.replyMany([]);
+  assert.equal(pool.busyCount, 0);
+  assert.equal(decoded.length, 2);
+});
+
+test("symbol boxes ride along to the decode callback", () => {
+  const boxes: unknown[] = [];
+  const created: FakeWorker[] = [];
+  const pool = new DecodeWorkerPool(
+    () => {
+      const worker = new FakeWorker(0);
+      created.push(worker);
+      return worker;
+    },
+    (_bytes, box) => boxes.push(box),
+  );
+  pool.resize(1);
+  pool.submit(frame(1), []);
+  created[0]!.onmessage?.({
+    data: {
+      id: 0,
+      symbols: [{ bytes: new Uint8Array([1]), box: { x: 5, y: 6, w: 40, h: 41 } }],
+    },
+  } as MessageEvent);
+  assert.deepEqual(boxes, [{ x: 5, y: 6, w: 40, h: 41 }]);
+});
+
+test("sightings reach the onSighted callback and never the decode path", () => {
+  const sighted: unknown[] = [];
+  const created: FakeWorker[] = [];
+  const pool = new DecodeWorkerPool(
+    () => {
+      const worker = new FakeWorker(0);
+      created.push(worker);
+      return worker;
+    },
+    () => {
+      throw new Error("a sighting must not be handed to onDecoded");
+    },
+    (box) => sighted.push(box),
+  );
+  pool.resize(1);
+  pool.submit(frame(1), []);
+  created[0]!.onmessage?.({
+    data: { id: 0, symbols: [], sightings: [{ x: 3, y: 4, w: 50, h: 51 }] },
+  } as MessageEvent);
+  assert.deepEqual(sighted, [{ x: 3, y: 4, w: 50, h: 51 }]);
+  assert.equal(pool.busyCount, 0, "a sighting-only reply still frees the slot");
+
+  // Workers built before the sightings field existed omit it entirely.
+  pool.submit(frame(2), []);
+  created[0]!.onmessage?.({ data: { id: 1, symbols: [] } } as MessageEvent);
+  assert.equal(pool.busyCount, 0);
+  assert.equal(sighted.length, 1);
+});
+
+test("quad, modules, and tracked flag ride along to the decode callback", () => {
+  const infos: unknown[] = [];
+  const created: FakeWorker[] = [];
+  const pool = new DecodeWorkerPool(
+    () => {
+      const worker = new FakeWorker(0);
+      created.push(worker);
+      return worker;
+    },
+    (_bytes, _box, info) => infos.push(info),
+  );
+  pool.resize(1);
+  pool.submit(frame(1), []);
+  const quad = {
+    topLeft: { x: 1, y: 2 },
+    topRight: { x: 40, y: 2 },
+    bottomRight: { x: 40, y: 41 },
+    bottomLeft: { x: 1, y: 41 },
+  };
+  created[0]!.onmessage?.({
+    data: {
+      id: 0,
+      symbols: [{ bytes: new Uint8Array([1]), box: { x: 1, y: 2, w: 39, h: 39 }, quad, modules: 177, tracked: true }],
+    },
+  } as MessageEvent);
+  assert.deepEqual(infos, [{ quad, modules: 177, tracked: true }]);
 });
 
 test("an empty pool accepts nothing", () => {

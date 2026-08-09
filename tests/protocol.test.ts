@@ -96,7 +96,7 @@ test("the frame header is byte-for-byte what the wire expects", () => {
   );
   assert.equal(
     [...frame].map((b) => b.toString(16).padStart(2, "0")).join(" "),
-    "d1 0c ef be 04 03 02 01 11 01 06 00 ba dc fe 00 ef cd ab 89 01 02 03 04 05 06",
+    "d1 0d ef be 04 03 02 01 11 01 06 00 ba dc fe 00 ef cd ab 89 01 02 03 04 05 06",
   );
   assert.equal(frame.length, HEADER_LEN + 6);
 

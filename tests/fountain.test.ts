@@ -1,7 +1,10 @@
 // fountain.ts IS the wire format. Sender and receiver derive every frame's
-// block subset independently and never compare notes, so a change to dlog(),
-// solitonCdf(), frameSeed(), splitmix32() or frameIndices() breaks
-// compatibility silently — the transfer just never completes. That matters
+// block subset independently and never compare notes, so a change to
+// frameComposition(), frameSeed() or splitmix32() breaks compatibility
+// silently — the transfer just never completes. (dlog, solitonCdf and
+// frameIndices are the v1 soliton stream, no longer emitted since the v2
+// carousel, but still pinned below: the vectors were expensive to derive
+// and a future format may want the machinery back.) That matters
 // more here than in most projects: standalone sender/receiver HTML files are
 // attached to releases, and people keep them and re-use them months later.
 //
@@ -11,7 +14,15 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LTDecoder, LTEncoder, dlog, frameIndices, solitonCdf } from "../shared/fountain.ts";
+import {
+  LTDecoder,
+  LTEncoder,
+  cycleLength,
+  dlog,
+  frameComposition,
+  frameIndices,
+  solitonCdf,
+} from "../shared/fountain.ts";
 import { fnv1a, splitmix32 } from "../shared/protocol.ts";
 
 // ---------------------------------------------------------------- dlog
@@ -171,11 +182,14 @@ function testPayload(byteLength: number): Uint8Array {
 test("the encoded stream is byte-identical to its recorded fingerprint", () => {
   // The end-to-end pin: covers dlog, solitonCdf, frameSeed, splitmix32,
   // frameIndices, the block padding and the XOR order in one hash.
+  // Re-recorded for wire format v2 (systematic carousel, header magic 0x0D).
+  // The k=179 and k=716 hashes cover only the sweep (64 frames < k); k=23
+  // covers a full sweep plus repair frames.
   const golden: [number, number, number, string][] = [
     [1, 64, 1, "k=1 fnv=0xf6a115c5"],
-    [23, 64, 7, "k=23 fnv=0x2aafe48d"],
-    [179, 2933, 4242, "k=179 fnv=0x83bbd1d7"],
-    [716, 1445, 65535, "k=716 fnv=0x15e10360"],
+    [23, 64, 7, "k=23 fnv=0x4a5d3eaa"],
+    [179, 2933, 4242, "k=179 fnv=0x54f78d05"],
+    [716, 1445, 65535, "k=716 fnv=0x75b73b85"],
   ];
   for (const [k, blockLen, sessionId, expected] of golden) {
     const encoder = new LTEncoder(testPayload(k * blockLen - 7), blockLen, sessionId);
@@ -200,6 +214,8 @@ test("every frame is exactly blockLen bytes", () => {
 interface RoundTrip {
   frames: number;
   overhead: number;
+  /** Seqs the sender had to emit per source block, loss included. */
+  wallClock: number;
   recovered: Uint8Array | null;
 }
 
@@ -218,9 +234,37 @@ function roundTrip(byteLength: number, blockLen: number, sessionId: number, drop
   return {
     frames: decoder.framesNew,
     overhead: decoder.framesNew / encoder.k,
+    wallClock: seq / encoder.k,
     recovered: decoder.assemble(),
   };
 }
+
+test("a re-swept block the receiver already solved counts as redundant, not progress", () => {
+  // The progress bar runs on framesNew − framesRedundant: on a lossy stream
+  // the carousel re-sweeps solved blocks under fresh seqs, and counting those
+  // as progress showed 96% with half the blocks outstanding.
+  const blockLen = 64;
+  const payload = testPayload(23 * blockLen - 7);
+  const encoder = new LTEncoder(payload, blockLen, 77);
+  const decoder = new LTDecoder(encoder.k, blockLen, 77, payload.length);
+
+  decoder.addFrame(0, encoder.encode(0));
+  assert.equal(decoder.solvedCount, 1);
+  assert.equal(decoder.framesRedundant, 0);
+
+  // Same block, next cycle: a NEW seq carrying nothing the receiver lacks.
+  const nextCycle = cycleLength(encoder.k);
+  decoder.addFrame(nextCycle, encoder.encode(nextCycle));
+  assert.equal(decoder.framesNew, 2, "a fresh seq is still a new frame");
+  assert.equal(decoder.framesDup, 0);
+  assert.equal(decoder.framesRedundant, 1);
+  assert.equal(decoder.solvedCount, 1);
+
+  // An unsolved block's sweep frame is information, never redundant.
+  decoder.addFrame(1, encoder.encode(1));
+  assert.equal(decoder.framesRedundant, 1);
+  assert.equal(decoder.solvedCount, 2);
+});
 
 test("a payload survives the fountain exactly", () => {
   for (const [byteLength, blockLen] of [
@@ -237,12 +281,63 @@ test("a payload survives the fountain exactly", () => {
 });
 
 test("dropping 30% of frames costs time, never correctness", () => {
-  const { recovered, overhead } = roundTrip(512 * 1024, 2933, 23, 0.3);
+  const { recovered, overhead, wallClock } = roundTrip(512 * 1024, 2933, 23, 0.3);
   assert.ok(recovered);
   assert.deepEqual(recovered, testPayload(512 * 1024));
-  // The receiver only ever sees distinct frames, so loss must not inflate the
-  // count it needs — it only slows their arrival.
-  assert.ok(overhead < 1.6, `unique-frame overhead ${overhead.toFixed(2)} is too high`);
+  // Carousel bounds, measured at k=179 over 20 trials (worst wall clock 2.11
+  // seqs per block at 30% drop) with margin. Unlike v1, framesNew can include
+  // re-swept blocks the receiver already solved, so it is bounded looser.
+  assert.ok(wallClock < 2.8, `wall clock ${wallClock.toFixed(2)} seqs/block is too high`);
+  assert.ok(overhead < 1.8, `unique-frame overhead ${overhead.toFixed(2)} is too high`);
+});
+
+test("a receiver that catches one clean sweep pays zero fountain overhead", () => {
+  const byteLength = 200_000;
+  const blockLen = 1445;
+  const payload = testPayload(byteLength);
+  const encoder = new LTEncoder(payload, blockLen, 55);
+  const decoder = new LTDecoder(encoder.k, blockLen, 55, byteLength);
+  for (let seq = 0; seq < encoder.k; seq++) decoder.addFrame(seq, encoder.encode(seq));
+  assert.ok(decoder.isComplete, "one full sweep must complete the transfer");
+  assert.equal(decoder.framesNew, encoder.k);
+  assert.deepEqual(decoder.assemble(), payload);
+});
+
+test("the carousel composition is systematic in the sweep, mid-degree after", () => {
+  for (const k of [1, 17, 179, 4096]) {
+    assert.equal(cycleLength(k), 2 * k);
+    for (const pos of new Set([0, k >> 1, k - 1])) {
+      assert.deepEqual(frameComposition(k, 9, pos), [pos], `k=${k} sweep pos=${pos}`);
+      // The sweep restarts every cycle, at any cycle number.
+      assert.deepEqual(frameComposition(k, 9, pos + 6 * cycleLength(k)), [pos]);
+    }
+    for (const seq of [k, k + 1, 2 * k - 1]) {
+      const idx = frameComposition(k, 9, seq);
+      assert.ok(idx.length >= Math.min(k, 4) && idx.length <= Math.min(k, 24), `k=${k} seq=${seq} degree ${idx.length}`);
+      assert.equal(new Set(idx).size, idx.length);
+      for (const b of idx) assert.ok(Number.isInteger(b) && b >= 0 && b < k);
+    }
+  }
+});
+
+test("a receiver joining mid-cycle completes without a handshake", () => {
+  // The sender has been looping for a while; the receiver starts cold at an
+  // arbitrary seq. Measured worst over 20 trials: 1.34 seqs per block.
+  const byteLength = 512 * 1024;
+  const blockLen = 2933;
+  const payload = testPayload(byteLength);
+  const encoder = new LTEncoder(payload, blockLen, 91);
+  const decoder = new LTDecoder(encoder.k, blockLen, 91, byteLength);
+  const start = Math.floor(encoder.k / 3);
+  let seq = start;
+  while (!decoder.isComplete && seq < start + encoder.k * 4) {
+    decoder.addFrame(seq, encoder.encode(seq));
+    seq++;
+  }
+  assert.ok(decoder.isComplete);
+  assert.deepEqual(decoder.assemble(), payload);
+  const wallClock = (seq - start) / encoder.k;
+  assert.ok(wallClock < 1.7, `mid-join took ${wallClock.toFixed(2)} seqs/block`);
 });
 
 test("frames decode in any order", () => {

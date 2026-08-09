@@ -1,17 +1,23 @@
 <!--
-Please read this before spending any more time on the PR.
+Please read this before spending more time on the PR.
 
-**I am not accepting pull requests.** This is a proof of concept with a
-deliberately small surface, and I don't have the bandwidth to review
-contributions properly. This one will be closed unread — that is not a
-judgement of the work, it's the policy, and it applies to everyone.
+Pull requests are considered — selectively, and with a CLA. Two things
+decide whether this PR can land:
 
-What is welcome instead:
+- **Was there an issue first?** Small, focused fixes are the easiest to
+  take. Large features may be declined regardless of quality — open an
+  issue before writing code.
+- **The CLA.** Every merged contribution needs a signed CLA (the bot will
+  prompt below; signing is one comment). See CLA.md for the terms — you
+  keep your copyright, and your contribution always remains available
+  under the AGPL.
+
+Also welcome:
 
 - **Bug reports**, especially device/browser/camera combinations where the
   receiver fails to decode. There's an issue template for it.
 - **Questions** about how any of it works. Open an issue.
-- **Forks.** MIT licensed. Build something better on top of it.
+- **Forks.** AGPL-3.0-or-later. Build something better on top of it — just keep it open under the same terms.
 
 See CONTRIBUTING.md.
 -->

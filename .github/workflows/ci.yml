@@ -63,3 +63,11 @@ jobs:
               echo "dist/$page.html: $ref -> ${target#"$PWD/"}"
             done
           done
+
+      # benchmarks/records.json is the truth; the README section is generated
+      # from it (build/benchmarks.ts). A diff here means someone hand-edited
+      # the section or forgot to run benchmark:readme after promoting.
+      - name: README benchmarks section matches records
+        run: |
+          npm run benchmark:readme
+          git diff --exit-code README.md

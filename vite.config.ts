@@ -14,13 +14,14 @@ import {
   TX_FPS_OPTIONS,
 } from "./shared/send-settings";
 import { htmlTokens } from "./build/html-tokens";
-import { inlineZxingWasm } from "./build/inline-zxing-wasm";
+import { inlineCodecWasm } from "./build/inline-codec-wasm";
 import { useInlineVariants } from "./build/use-inline-variants";
 import { rewriteStandaloneLinks } from "./build/rewrite-standalone-links";
 import { standaloneCsp } from "./build/standalone-csp";
 import { emitAs } from "./build/emit-as";
 import { rootPwaHead } from "./build/root-pwa-head";
 import { licenseBanner } from "./build/license-banner";
+import { diagnosticsEndpoint } from "./build/diagnostics-endpoint";
 
 // Where the site is published, used only to make the social-card URLs absolute
 // — scrapers are inconsistent about resolving relative ones. Override with
@@ -95,7 +96,7 @@ export default defineConfig(({ mode }) => {
       plugins: [
         htmlTokens(TOKENS),
         useInlineVariants(__dirname),
-        inlineZxingWasm(),
+        inlineCodecWasm(),
         rewriteStandaloneLinks(page),
         standaloneCsp(page),
         viteSingleFile(),
@@ -104,7 +105,7 @@ export default defineConfig(({ mode }) => {
       ],
       // Workers are bundled in their own Rollup pass and do not inherit the
       // plugin list, so both plugins have to be registered again here.
-      worker: { format: "iife", plugins: () => [useInlineVariants(__dirname), inlineZxingWasm()] },
+      worker: { format: "iife", plugins: () => [useInlineVariants(__dirname), inlineCodecWasm()] },
       build: {
         outDir,
         emptyOutDir: false,
@@ -152,8 +153,9 @@ export default defineConfig(({ mode }) => {
           // because only the hard reload bypasses the service worker.
           // clientsClaim() makes the new worker adopt open clients immediately.
           clientsClaim: true,
-          // The decoder wasm is 940 KB and is the whole point of caching this
-          // app offline, so it has to be allowed past the default size limit.
+          // success-2mb.png is exactly 2 MiB — right at workbox's per-file
+          // default — and benchmark.png adds another meg; the explicit
+          // ceiling removes the boundary edge and leaves headroom.
           maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
           globPatterns: ["**/*.{js,css,html,wasm,png,svg}"],
           // Received media plays from the Cache API at a real URL: iOS Safari
@@ -177,6 +179,7 @@ export default defineConfig(({ mode }) => {
       }),
       rootPwaHead(),
       licenseBanner(pkg.version),
+      diagnosticsEndpoint(pkg.version),
     ],
     build: {
       rollupOptions: {
