@@ -1385,3 +1385,54 @@ details.settings input[type="range"] {
     max-width: 100%;
   }
 }
+
+/* Support (hosted builds only — the standalone rewrite strips the footer link
+   and the module swap no-ops the post-transfer line). Quiet by design. */
+.support-card {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin: 26px auto 0;
+  padding: 14px 18px;
+  max-width: 460px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.support-mug {
+  width: 28px;
+  height: 28px;
+  color: var(--accent);
+  flex: none;
+}
+.support-title {
+  margin: 0;
+  color: var(--text);
+}
+.support-text {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.support-text a,
+.support-after a,
+.site-footer .support-link {
+  color: var(--accent);
+}
+.support-after {
+  margin-top: 10px;
+  font-size: 13px;
+  text-align: center;
+}
+
+/* Post-transfer end actions: keep the two buttons side by side on phones —
+   the pair shares the row and labels wrap inside the buttons, instead of the
+   row breaking into a stack that reads as a list. */
+.note-actions.pair {
+  flex-wrap: nowrap;
+}
+.note-actions.pair > .secondary-button {
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: normal;
+}

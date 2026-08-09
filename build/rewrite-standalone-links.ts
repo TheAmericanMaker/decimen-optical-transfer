@@ -55,6 +55,15 @@ export function rewriteStandaloneLinks(page: "send" | "receive"): Plugin {
       to: "",
       required: true,
     },
+    {
+      // Hosted-only: a downloaded artifact should not solicit. The JS-side
+      // counterpart is the support.ts → support.inline.ts module swap.
+      from:
+        ' · <a class="support-link" href="https://buymeacoffee.com/bashalarmist" ' +
+        'target="_blank" rel="noopener noreferrer">♥ support</a>',
+      to: "",
+      required: true,
+    },
   ];
   return {
     name: "rewrite-standalone-links",

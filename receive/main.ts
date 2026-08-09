@@ -39,6 +39,7 @@ import { statusLine } from "../shared/status-line";
 import { requestScreenWakeLock } from "../shared/wake-lock";
 import { applyAdvancedConstraint, probeCameraCapabilities } from "../shared/platform";
 import { closeOnBackdropClick } from "../shared/dialog";
+import { supportLink } from "./support";
 
 const startBtn = document.getElementById("start") as HTMLButtonElement;
 const video = document.getElementById("video") as HTMLVideoElement;
@@ -976,13 +977,15 @@ async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
     actions.className = "note-actions";
     actions.append(download);
     const endActions = document.createElement("div");
-    endActions.className = "note-actions";
+    endActions.className = "note-actions pair";
     endActions.append(restartButton("Receive another file"));
     // The received bytes sit in the Cache API so the media player can range
     // over them (see servableMediaUrl) — which means they outlive the page.
     // Offer the scrub right where the transfer ends.
     if ("caches" in window) endActions.append(clearCacheButton());
     result.append(actions, endActions);
+    const support = supportLink();
+    if (support) result.append(support);
   } catch (error) {
     // Everything is already torn down by this point, so the only way back to a
     // live receiver is a reload. Offer it: a failed checksum used to leave the

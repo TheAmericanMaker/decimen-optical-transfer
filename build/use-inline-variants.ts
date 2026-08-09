@@ -14,6 +14,7 @@ export function useInlineVariants(rootDir: string): Plugin {
   const swaps = new Map([
     ["./worker-factory", "receive/worker-factory.inline.ts"],
     ["./wasm-url", "receive/wasm-url.inline.ts"],
+    ["./support", "receive/support.inline.ts"],
   ]);
   return {
     name: "use-inline-variants",
