@@ -70,8 +70,17 @@ const selectOptions = (values: readonly number[], selected: number) =>
     .map((v) => (v === selected ? `<option selected>${v}</option>` : `<option>${v}</option>`))
     .join("");
 
+// The og-description speed claim reads the benchmark records at build time,
+// so the social-card text can never lag the published table.
+const topSustained = (
+  JSON.parse(readFileSync(resolve(__dirname, "benchmarks/records.json"), "utf8")) as {
+    sustained: { sustainedKBs: number } | null;
+  }
+).sustained;
+
 // One token set for every mode — the standalone pages carry these tokens too.
 const TOKENS = {
+  TOP_SPEED: topSustained ? `Up to ${Math.floor(topSustained.sustainedKBs)} KB/s` : "Hundreds of KB/s",
   MAX_FILE_LABEL,
   MAX_SNIPPET_LABEL,
   SITE_URL,
