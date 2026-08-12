@@ -26,7 +26,10 @@ jobs:
       - run: npm test
       - run: npm run build:all
       # A regression here means the inlined worker or wasm leaked into the
-      # served bundle — see build/use-inline-variants.ts.
+      # served bundle — see build/use-inline-variants.ts. The bound is an
+      # order-of-magnitude tripwire, not a byte budget: the leak it exists to
+      # catch adds hundreds of KB. Re-margined 20000 → 24000 in 0.5.0, when
+      # wire-v3 verdicts and auto-show legitimately grew the chunk past 20 KB.
       - name: Served receive chunk stays small
         run: |
           shopt -s nullglob
@@ -40,7 +43,7 @@ jobs:
           fi
           bytes=$(stat -c%s "${chunks[0]}")
           echo "receive chunk: ${chunks[0]} — $bytes bytes"
-          test "$bytes" -lt 20000
+          test "$bytes" -lt 24000
 
       # rootPwaHead() in build/root-pwa-head.ts already asserts this at build
       # time, but only against the HTML it rewrote. This checks the files on disk
