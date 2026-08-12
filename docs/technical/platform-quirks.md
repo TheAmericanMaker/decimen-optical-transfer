@@ -8,6 +8,8 @@ The hard-won details baked into the code, so nobody has to rediscover them.
 - **iOS may refuse a live `applyConstraints`.** The receiver keeps the running stream and says so rather than tearing down a transfer.
 - **Capabilities are probed, not UA-sniffed** (`shared/platform.ts`). Android Chrome exposes `torch`, `focusMode`, `frameRate.max` via `getCapabilities()`; iOS exposes none of them. Continuous autofocus is applied when available; unreachable fps options are disabled. `torch` is reported but deliberately unused — the sender is an emissive screen, a flashlight only adds glare.
 - **`requestVideoFrameCallback` chains outlive their stream** and resume on the next one; a generation counter prevents zombie capture loops.
+- **One camera at a time.** Phones will not open a second camera while one is live, so switching devices stops the current track *before* the new `getUserMedia` — which is why a refused switch needs an explicit reacquire fallback rather than keeping the stream it no longer has (`switchCamera` in `receive/main.ts`). And `enumerateDevices` labels are blank until permission is granted, which is why the camera picker fills in only after the first start.
+- **Auto camera selection picks the wrong lens on some phones.** `facingMode: environment` hands over the telephoto on a Huawei P30 Pro (blurry until the user backs across the room) and the front camera on others. Field reports, not speculation — the camera picker exists because auto cannot be trusted on every device.
 
 ## QR decoding
 

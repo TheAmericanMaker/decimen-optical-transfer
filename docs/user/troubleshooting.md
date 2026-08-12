@@ -41,6 +41,7 @@ every QR code in view. See "Nothing happening?" above.
 
 ## Camera problems
 
+- **Wrong camera** — the front camera instead of the rear one, or a telephoto that stays blurry unless you stand across the room. Some phones hand the browser the wrong lens as "the" rear camera; pick the right one under **Receive settings → camera**. The list shows real camera names once the camera has started, and switching applies immediately, mid-transfer included.
 - **Permission denied** — tap the browser's permission prompt carefully; if you hit Block by accident, allow camera for the site and tap **Start camera** again (no reload needed).
 - **"camera needs a secure context"** — the page is being served over plain http. Browsers remove the camera API on insecure origins; serve over https (the dev server already does, self-signed) or use [decimen.app](https://decimen.app/).
 - **Standalone receiver file** — opening `decimen-receiver.html` from `file://` will not get a camera on iOS or Android. See [Install & offline](install-and-offline.md).

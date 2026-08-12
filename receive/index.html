@@ -85,6 +85,12 @@
         <details class="settings" id="settings">
           <summary>Receive settings</summary>
           <div class="row">
+            <label class="camera-pick">camera
+              <!-- One option until the camera runs: browsers return blank
+                   device labels before permission is granted, so the real
+                   list is filled by populateCameraOptions() after start. -->
+              <select id="cfg-camera"><option value="" selected>auto</option></select>
+            </label>
             <label>capture width
               <select id="cfg-width"><option>960</option><option selected>1280</option><option>1920</option><option>2560</option><option>3840</option></select>
             </label>

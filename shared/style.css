@@ -352,6 +352,12 @@ details.settings input[type="checkbox"] {
   margin: 0;
   accent-color: var(--accent);
 }
+/* Camera names are prose ("Back Telephoto Camera"), not numbers like every
+   other option in the row — cap the select so a long label wraps the flex row
+   instead of stretching it off a phone screen. */
+details.settings label.camera-pick select {
+  max-width: 220px;
+}
 .settings-actual {
   margin: 10px 0 2px;
   padding-top: 9px;

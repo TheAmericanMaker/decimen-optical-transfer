@@ -61,6 +61,7 @@ const settingsEl = document.getElementById("settings")!;
 const cfgWidth = document.getElementById("cfg-width") as HTMLSelectElement;
 const cfgCapFps = document.getElementById("cfg-capfps") as HTMLSelectElement;
 const cfgWorkers = document.getElementById("cfg-workers") as HTMLSelectElement;
+const cfgCamera = document.getElementById("cfg-camera") as HTMLSelectElement;
 const cfgAutoShow = document.getElementById("cfg-autoshow") as HTMLInputElement;
 
 /**
@@ -444,6 +445,70 @@ function offerRetry(message: string) {
   showError(message);
 }
 
+/**
+ * The user's camera pick, or auto. Auto asks for the environment-facing camera
+ * and lets the browser choose a lens — a choice some phones get wrong: a
+ * Huawei P30 Pro hands over the telephoto (blurry until you back across the
+ * room), and some devices hand over the front camera outright. An explicit
+ * pick pins the exact device instead.
+ */
+function cameraSelection(): MediaTrackConstraints {
+  return cfgCamera.value
+    ? { deviceId: { exact: cfgCamera.value } }
+    : { facingMode: "environment" };
+}
+
+/** getUserMedia with the shared width/fps settings applied. Frame rate is
+ *  demanded exactly first — iOS hands back 30 fps after accepting a polite
+ *  request for 60 — and the ideal retry takes what the camera can give. */
+async function acquireCamera(selection: MediaTrackConstraints): Promise<MediaStream> {
+  const captureWidth = Number(cfgWidth.value);
+  const captureFps = Number(cfgCapFps.value);
+  const base: MediaTrackConstraints = {
+    ...selection,
+    width: { ideal: captureWidth },
+    height: { ideal: Math.round((captureWidth * 3) / 4) },
+  };
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { ...base, frameRate: { exact: captureFps } },
+    });
+  } catch {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { ...base, frameRate: { ideal: captureFps } },
+    });
+  }
+}
+
+/**
+ * Fill the camera <select> with the device's actual cameras.
+ *
+ * Runs after every successful acquisition, not at page load: enumerateDevices
+ * returns blank labels until camera permission is granted, and a list reading
+ * "camera 1 / camera 2" is exactly the guessing game the picker exists to end.
+ * The current pick survives the rebuild; a pick whose device vanished falls
+ * back to auto rather than leaving the select pointing at nothing.
+ */
+async function populateCameraOptions() {
+  let devices: MediaDeviceInfo[];
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch {
+    return; // no list, no picker — auto still works
+  }
+  const cameras = devices.filter((d) => d.kind === "videoinput");
+  // A single camera offers no choice: keep the plain auto-only select.
+  if (cameras.length < 2) return;
+  const chosen = cfgCamera.value;
+  cfgCamera.replaceChildren(
+    new Option("auto", ""),
+    ...cameras.map((d, i) => new Option(d.label || `camera ${i + 1}`, d.deviceId)),
+  );
+  cfgCamera.value = cameras.some((d) => d.deviceId === chosen) ? chosen : "";
+}
+
 async function start() {
   if (!navigator.mediaDevices?.getUserMedia) {
     // On insecure origins the API doesn't exist AT ALL — this is the plain-
@@ -454,35 +519,21 @@ async function start() {
     );
     return;
   }
-  const captureWidth = Number(cfgWidth.value);
-  const captureFps = Number(cfgCapFps.value);
   // Nothing on the page changes until the camera is actually running: the
   // error paths below all have to leave a usable Start button behind.
   startBtn.disabled = true;
   startBtn.textContent = "Starting…";
-  const base: MediaTrackConstraints = {
-    facingMode: "environment",
-    width: { ideal: captureWidth },
-    height: { ideal: Math.round((captureWidth * 3) / 4) },
-  };
   try {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { ...base, frameRate: { exact: captureFps } },
-      });
-    } catch {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { ...base, frameRate: { ideal: captureFps } },
-      });
-    }
+    stream = await acquireCamera(cameraSelection());
   } catch (err) {
     const denied = err instanceof DOMException && err.name === "NotAllowedError";
+    const gone = err instanceof DOMException && err.name === "OverconstrainedError";
     offerRetry(
       denied
         ? "camera permission denied — allow it, then tap Start camera again."
-        : `camera: ${err instanceof Error ? err.message : String(err)}`,
+        : gone
+          ? "that camera is no longer available — set camera back to auto and tap Start camera."
+          : `camera: ${err instanceof Error ? err.message : String(err)}`,
     );
     return;
   }
@@ -503,11 +554,15 @@ async function start() {
   pool.resize(Number(cfgWorkers.value));
   reportCameraSettings();
   void applyCameraExtras();
+  void populateCameraOptions();
   if (!settingsWired) {
     settingsWired = true;
     for (const el of [cfgWidth, cfgCapFps, cfgWorkers]) {
       el.addEventListener("change", () => void applyReceiveSettings());
     }
+    // The camera pick is the one setting a live track cannot applyConstraints
+    // its way into — switching lenses means a fresh getUserMedia.
+    cfgCamera.addEventListener("change", () => void switchCamera());
   }
 
   noSignal.cameraStarted(performance.now());
@@ -543,15 +598,67 @@ async function applyCameraExtras() {
   if (caps.continuousFocus) {
     await applyAdvancedConstraint(track, { focusMode: "continuous" });
   }
-  if (caps.maxFrameRate) {
-    for (const option of Array.from(cfgCapFps.options)) {
-      option.disabled = Number(option.value) > caps.maxFrameRate;
+  // Unconditional loops, not gated on the cap existing: with a camera picker
+  // these limits change within a session (a telephoto's ceiling is not the
+  // wide lens's), and a gray-out left over from the last lens would misreport
+  // this one.
+  for (const option of Array.from(cfgCapFps.options)) {
+    option.disabled = caps.maxFrameRate ? Number(option.value) > caps.maxFrameRate : false;
+  }
+  for (const option of Array.from(cfgWidth.options)) {
+    option.disabled = caps.maxWidth ? Number(option.value) > caps.maxWidth : false;
+  }
+}
+
+/**
+ * Reacquire the camera for a new pick from the settings select.
+ *
+ * The current track is stopped FIRST: phones will not open a second camera
+ * while one is live, so the old one has to die before the new request — which
+ * is also why failure needs an explicit fallback instead of just keeping the
+ * stream we had. Decode state is untouched throughout; frames simply pause
+ * until the new camera delivers (requestVideoFrameCallback rides the video
+ * element, not the stream, so the capture loop survives the swap).
+ */
+async function switchCamera() {
+  if (done || !stream) return;
+  cfgCamera.disabled = true; // one switch at a time
+  const previous = stream.getVideoTracks()[0]?.getSettings().deviceId;
+  for (const track of stream.getTracks()) track.stop();
+  let refused = false;
+  try {
+    stream = await acquireCamera(cameraSelection());
+  } catch {
+    try {
+      // Any camera beats a dead receiver: back to the one that was running,
+      // or auto if even its id is gone.
+      stream = await acquireCamera(
+        previous ? { deviceId: { exact: previous } } : { facingMode: "environment" },
+      );
+      refused = true;
+    } catch {
+      // Both attempts failed — the hardware is wedged or was unplugged. Put
+      // the Start button back; decode state survives for a resumed session.
+      stream = null;
+      video.srcObject = null;
+      cfgCamera.disabled = false;
+      offerRetry("camera: could not restart after the switch — tap Start camera.");
+      return;
     }
   }
-  if (caps.maxWidth) {
-    for (const option of Array.from(cfgWidth.options)) {
-      option.disabled = Number(option.value) > caps.maxWidth;
-    }
+  cfgCamera.disabled = false;
+  video.srcObject = stream;
+  await video.play().catch(() => undefined);
+  syncPreviewAspect();
+  reportCameraSettings();
+  void applyCameraExtras();
+  await populateCameraOptions();
+  if (refused) {
+    // After reportCameraSettings wrote its normal line — the refusal is the
+    // more useful thing for the status line to say.
+    cameraActual.textContent = "that camera refused to start — kept the previous one";
+    cfgCamera.value =
+      previous && Array.from(cfgCamera.options).some((o) => o.value === previous) ? previous : "";
   }
 }
 
