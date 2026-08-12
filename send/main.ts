@@ -370,6 +370,10 @@ async function startStream(revealStage = false) {
     blockLen,
     totalLen: payload.length,
     payloadFnv: fnv1a(payload),
+    // No feature bits: this build sends the plain v3 format (see FLAG_* in
+    // protocol.ts). Spelled out rather than defaulted so adding a flag is a
+    // decision made here, not an omission.
+    flags: 0,
   };
 
   let version: number | undefined; // locked after the first frame

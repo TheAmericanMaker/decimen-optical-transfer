@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  classifyFrame,
+  CRITICAL_FLAGS,
+  FLAG_ENCRYPTED,
   HEADER_LEN,
   type FrameHeader,
+  frameVerdictMessage,
   isPrecompressedType,
   packFile,
   packFrame,
@@ -10,6 +14,7 @@ import {
   streamIdentity,
   unpackFile,
   verifyFile,
+  WIRE_VERSION,
 } from "../shared/protocol.ts";
 
 test("arbitrary file metadata and bytes survive the optical container", async () => {
@@ -81,8 +86,10 @@ test("filenames that sanitise away fall back to a safe default", async () => {
 });
 
 test("the frame header is byte-for-byte what the wire expects", () => {
-  // 20-byte little-endian header, then the block. Both ends parse this without
+  // 22-byte little-endian header, then the block. Both ends parse this without
   // negotiating, and standalone builds from older releases stay in circulation.
+  // This vector IS the format: a diff here is a wire change and gets reviewed
+  // as one (docs/technical/golden-vectors.md).
   const frame = packFrame(
     {
       sessionId: 0xbeef,
@@ -91,12 +98,13 @@ test("the frame header is byte-for-byte what the wire expects", () => {
       blockLen: 6,
       totalLen: 0x00fedcba,
       payloadFnv: 0x89abcdef,
+      flags: 0,
     },
     new Uint8Array([1, 2, 3, 4, 5, 6]),
   );
   assert.equal(
     [...frame].map((b) => b.toString(16).padStart(2, "0")).join(" "),
-    "d1 0d ef be 04 03 02 01 11 01 06 00 ba dc fe 00 ef cd ab 89 01 02 03 04 05 06",
+    "d1 c3 03 00 ef be 04 03 02 01 11 01 06 00 ba dc fe 00 ef cd ab 89 01 02 03 04 05 06",
   );
   assert.equal(frame.length, HEADER_LEN + 6);
 
@@ -109,6 +117,7 @@ test("the frame header is byte-for-byte what the wire expects", () => {
     blockLen: 6,
     totalLen: 0x00fedcba,
     payloadFnv: 0x89abcdef,
+    flags: 0,
   });
   assert.deepEqual(parsed.block, new Uint8Array([1, 2, 3, 4, 5, 6]));
 });
@@ -191,17 +200,61 @@ test("streamIdentity changes with every field that must not drift mid-stream", (
     blockLen: 2933,
     totalLen: 293_300,
     payloadFnv: 0xdeadbeef,
+    flags: 0,
   };
   const identity = streamIdentity(base);
 
   // seq is the one field that varies within a stream.
   assert.equal(streamIdentity({ ...base, seq: 9999 }), identity);
 
-  for (const field of ["sessionId", "k", "blockLen", "totalLen", "payloadFnv"] as const) {
+  for (const field of [
+    "sessionId",
+    "k",
+    "blockLen",
+    "totalLen",
+    "payloadFnv",
+  ] as const) {
     assert.notEqual(
       streamIdentity({ ...base, [field]: base[field] + 1 }),
       identity,
       `${field} must force the receiver to start a new decoder`,
+    );
+  }
+
+  // Critical flags are in here ahead of any being supported: the day one is, a
+  // mid-stream change must start a new decoder, not poison the old one.
+  for (let bit = 1; bit <= 0xff; bit <<= 1) {
+    if ((bit & CRITICAL_FLAGS) === 0) continue;
+    assert.notEqual(
+      streamIdentity({ ...base, flags: bit }),
+      identity,
+      `critical flag 0x${bit.toString(16)} must force a new decoder`,
+    );
+  }
+});
+
+test("streamIdentity ignores the flag bits that are safe to ignore", () => {
+  // The other half of what CRITICAL_FLAGS means. A sender that flips an
+  // ignorable bit mid-stream is describing something we decode correctly
+  // either way — resetting on it would discard every block recovered so far,
+  // which is strictly worse than rejecting the frame, and would make the
+  // ignorable half of the byte a lie.
+  const base: FrameHeader = {
+    sessionId: 7,
+    seq: 0,
+    k: 100,
+    blockLen: 2933,
+    totalLen: 293_300,
+    payloadFnv: 0xdeadbeef,
+    flags: 0,
+  };
+  const identity = streamIdentity(base);
+  for (let bit = 1; bit <= 0xff; bit <<= 1) {
+    if (bit & CRITICAL_FLAGS) continue;
+    assert.equal(
+      streamIdentity({ ...base, flags: bit }),
+      identity,
+      `ignorable flag 0x${bit.toString(16)} must not restart the transfer`,
     );
   }
 });
@@ -209,14 +262,14 @@ test("streamIdentity changes with every field that must not drift mid-stream", (
 test("streamIdentity fields cannot be confused by the separator", () => {
   // A naive join would make {k: 1, blockLen: 23} and {k: 12, blockLen: 3}
   // collide, and the receiver would feed one stream's frames into the other.
-  const a: FrameHeader = { sessionId: 1, seq: 0, k: 1, blockLen: 23, totalLen: 4, payloadFnv: 5 };
-  const b: FrameHeader = { sessionId: 1, seq: 0, k: 12, blockLen: 3, totalLen: 4, payloadFnv: 5 };
+  const a: FrameHeader = { sessionId: 1, seq: 0, k: 1, blockLen: 23, totalLen: 4, payloadFnv: 5, flags: 0 };
+  const b: FrameHeader = { sessionId: 1, seq: 0, k: 12, blockLen: 3, totalLen: 4, payloadFnv: 5, flags: 0 };
   assert.notEqual(streamIdentity(a), streamIdentity(b));
 });
 
 test("frames that are not ours, or not self-consistent, are rejected", () => {
   const good = packFrame(
-    { sessionId: 1, seq: 2, k: 3, blockLen: 4, totalLen: 10, payloadFnv: 0 },
+    { sessionId: 1, seq: 2, k: 3, blockLen: 4, totalLen: 10, payloadFnv: 0, flags: 0 },
     new Uint8Array([9, 9, 9, 9]),
   );
   assert.ok(parseFrame(good));
@@ -229,6 +282,138 @@ test("frames that are not ours, or not self-consistent, are rejected", () => {
   assert.equal(parseFrame(good.subarray(0, good.length - 1)), null, "truncated block");
 
   const zeroK = good.slice();
-  new DataView(zeroK.buffer).setUint16(8, 0, true);
+  new DataView(zeroK.buffer).setUint16(10, 0, true);
   assert.equal(parseFrame(zeroK), null, "k=0 would divide by zero downstream");
+});
+
+// ---------------------------------------------------------------------------
+// Cross-version rejection. These are the negative vectors that make the version
+// field worth having: a receiver must be able to tell an old sender, a new
+// sender, and an unreadable feature apart from ordinary camera noise — and say
+// which. See docs/technical/versioning.md.
+
+/** A well-formed v3 frame, ready to be tampered with. */
+function goodFrame(): Uint8Array {
+  return packFrame(
+    { sessionId: 1, seq: 2, k: 3, blockLen: 4, totalLen: 10, payloadFnv: 0, flags: 0 },
+    new Uint8Array([9, 9, 9, 9]),
+  );
+}
+
+function withByte(offset: number, value: number): Uint8Array {
+  const frame = goodFrame();
+  frame[offset] = value;
+  return frame;
+}
+
+test("the magic pair cannot be confused with a pre-versioning format", () => {
+  // Deployed v2 receivers accept a frame only when byte 1 is exactly 0x0d, and
+  // every field moved in v3. If magic1 ever collided with a legacy marker,
+  // those receivers would misparse v3 frames into silent garbage instead of
+  // rejecting them.
+  const [magic1] = goodFrame().subarray(1, 2);
+  assert.notEqual(magic1, 0x0c);
+  assert.notEqual(magic1, 0x0d);
+  assert.equal(goodFrame()[2], WIRE_VERSION, "the version rides in byte 2, not the magic");
+});
+
+test("a v3 receiver names a pre-versioning sender instead of going quiet", () => {
+  // v1 and v2 had no version field — their format marker sat where magic1 is
+  // now, which is exactly why those two byte values stay reserved forever.
+  for (const [marker, version] of [
+    [0x0c, 1],
+    [0x0d, 2],
+  ] as const) {
+    const verdict = classifyFrame(withByte(1, marker));
+    assert.deepEqual(verdict, { kind: "older-sender", version });
+    assert.match(frameVerdictMessage(verdict)!, /older Decimen format/);
+  }
+});
+
+test("a v3 receiver names a newer sender instead of going quiet", () => {
+  const verdict = classifyFrame(withByte(2, WIRE_VERSION + 1));
+  assert.deepEqual(verdict, { kind: "newer-sender", version: WIRE_VERSION + 1 });
+  assert.match(frameVerdictMessage(verdict)!, /newer Decimen format/);
+  // The whole point: an install in the field that predates a format can still
+  // explain itself, which is what store binaries need and v2 could not do.
+  assert.equal(parseFrame(withByte(2, WIRE_VERSION + 1)), null);
+});
+
+test("a v3 receiver names an older versioned sender too", () => {
+  // Dead branch today — nothing ever shipped magic1 with a version below 3 —
+  // but it is the branch that carries the whole scheme once v4 exists and a v4
+  // receiver meets a v3 screen. Version 0 is excluded: see below.
+  const verdict = classifyFrame(withByte(2, WIRE_VERSION - 1));
+  assert.deepEqual(verdict, { kind: "older-sender", version: WIRE_VERSION - 1 });
+  assert.match(frameVerdictMessage(verdict)!, /Update the sending device/);
+});
+
+test("version 0 is ours but nonsense, and says nothing", () => {
+  assert.deepEqual(classifyFrame(withByte(2, 0)), { kind: "malformed" });
+  assert.equal(parseFrame(withByte(2, 0)), null);
+});
+
+test("an unknown critical flag is refused with a message, not decoded anyway", () => {
+  assert.ok(FLAG_ENCRYPTED & CRITICAL_FLAGS, "encryption must be must-understand");
+  const verdict = classifyFrame(withByte(3, FLAG_ENCRYPTED));
+  assert.deepEqual(verdict, { kind: "unsupported-flags", flags: FLAG_ENCRYPTED });
+  assert.match(frameVerdictMessage(verdict)!, /cannot read/);
+  assert.equal(
+    parseFrame(withByte(3, FLAG_ENCRYPTED)),
+    null,
+    "never decode a payload we cannot honour",
+  );
+});
+
+test("an unknown ignorable flag decodes anyway, and rides through to the header", () => {
+  // The half of the flags byte that makes flags an extension mechanism rather
+  // than a politer format break. A build that rejected these could never be
+  // taught to accept them without another break — which is why the rule ships
+  // with v3 even though nothing sets these bits yet.
+  for (let bit = 1; bit <= 0xff; bit <<= 1) {
+    if (bit & CRITICAL_FLAGS) continue;
+    const frame = withByte(3, bit);
+    assert.deepEqual(classifyFrame(frame), { kind: "ok" }, `flag 0x${bit.toString(16)}`);
+    assert.equal(parseFrame(frame)!.header.flags, bit, "the bit survives parsing");
+  }
+});
+
+test("a mixed flags byte is judged on its critical half alone", () => {
+  let ignorable = 1;
+  while (ignorable & CRITICAL_FLAGS) ignorable <<= 1;
+  assert.deepEqual(classifyFrame(withByte(3, ignorable | FLAG_ENCRYPTED)), {
+    kind: "unsupported-flags",
+    flags: FLAG_ENCRYPTED, // the ignorable bit is not part of the complaint
+  });
+});
+
+test("frames that are not Decimen's stay silent", () => {
+  // Noise gets no advice: the receiver decodes every QR code in view, and a
+  // wrong "update your device" latches on screen until a real frame clears it.
+  for (const frame of [withByte(0, 0xd2), new Uint8Array([0xd1, 0xc3])]) {
+    const verdict = classifyFrame(frame);
+    assert.equal(verdict.kind, "foreign");
+    assert.equal(frameVerdictMessage(verdict), null);
+  }
+});
+
+test("a stray 0xD1 alone never produces version advice", () => {
+  // Regression: an earlier v3 draft gated on 0xD1 only and read byte 1 as the
+  // version, so ~1 binary QR payload in 256 was told to update a device that
+  // has never run Decimen. Both magic bytes have to match before this file is
+  // willing to say anything about versions at all.
+  const legacy = new Set([0x0c, 0x0d]);
+  const magic1 = goodFrame()[1]!;
+  for (let byte1 = 0; byte1 <= 0xff; byte1++) {
+    if (byte1 === magic1 || legacy.has(byte1)) continue;
+    const verdict = classifyFrame(withByte(1, byte1));
+    assert.equal(verdict.kind, "foreign", `byte1 0x${byte1.toString(16)} is not ours`);
+    assert.equal(frameVerdictMessage(verdict), null);
+  }
+});
+
+test("a good v3 frame classifies clean and carries no flags", () => {
+  assert.deepEqual(classifyFrame(goodFrame()), { kind: "ok" });
+  assert.equal(frameVerdictMessage({ kind: "ok" }), null);
+  assert.equal(parseFrame(goodFrame())!.header.flags, 0);
 });

@@ -326,6 +326,32 @@ details.settings input[type="range"] {
   border-radius: 6px;
   padding: 5px 8px;
 }
+/* The one setting that is a policy rather than a knob: it is read when a
+   transfer LANDS, not when the camera starts, and it is the only preference
+   Decimen persists across sessions (see docs/user/privacy.md). Reads as a
+   sentence, so it lays out as a row rather than the label-over-control column
+   the selects use. */
+details.settings label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+details.settings input[type="checkbox"] {
+  /* Sized up from the ~13px default for the same reason the selects are 16px:
+     a phone needs a real tap target. `flex: none` stops it squashing when the
+     label wraps on a narrow screen. */
+  width: 18px;
+  height: 18px;
+  flex: none;
+  margin: 0;
+  accent-color: var(--accent);
+}
 .settings-actual {
   margin: 10px 0 2px;
   padding-top: 9px;

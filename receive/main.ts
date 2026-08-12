@@ -27,7 +27,9 @@ import {
 } from "../shared/worker-pool";
 import { isSnippet, snippetText } from "../shared/snippet";
 import {
+  classifyFrame,
   fnv1a,
+  frameVerdictMessage,
   parseFrame,
   streamIdentity,
   unpackFile,
@@ -59,6 +61,38 @@ const settingsEl = document.getElementById("settings")!;
 const cfgWidth = document.getElementById("cfg-width") as HTMLSelectElement;
 const cfgCapFps = document.getElementById("cfg-capfps") as HTMLSelectElement;
 const cfgWorkers = document.getElementById("cfg-workers") as HTMLSelectElement;
+const cfgAutoShow = document.getElementById("cfg-autoshow") as HTMLInputElement;
+
+/**
+ * Whether a landed transfer puts itself on screen. The only preference Decimen
+ * persists (see docs/user/privacy.md).
+ *
+ * Every other setting is a <select> read when the camera starts, which is right
+ * for a knob you retune per room. A privacy choice that forgets itself on
+ * reload is no choice at all: the point is that the NEXT thing to arrive stays
+ * covered, and the next thing usually arrives in a new session.
+ *
+ * Both ends are guarded. localStorage throws outright under file:// (the
+ * standalone receiver) and in some privacy modes, and a settings checkbox is
+ * not worth taking the page down for. Unreadable means on — the same default
+ * the markup ships with.
+ */
+const AUTO_SHOW_KEY = "decimen:auto-show";
+cfgAutoShow.checked = ((): boolean => {
+  try {
+    return localStorage.getItem(AUTO_SHOW_KEY) !== "off";
+  } catch {
+    return true;
+  }
+})();
+cfgAutoShow.addEventListener("change", () => {
+  try {
+    localStorage.setItem(AUTO_SHOW_KEY, cfgAutoShow.checked ? "on" : "off");
+  } catch {
+    // Nothing to say: the choice still holds for this session, it just won't
+    // survive a reload.
+  }
+});
 const cameraActual = document.getElementById("camera-actual")!;
 const noSignalToast = document.getElementById("no-signal")!;
 const noSignalDialog = document.getElementById("no-signal-dialog") as HTMLDialogElement;
@@ -721,18 +755,54 @@ function captureFrame() {
   cropRotate++;
 }
 
+/**
+ * The version/flags message currently on the status line, if any.
+ *
+ * A mismatched sender keeps sending: without this the same string would be
+ * written to the DOM once per decoded symbol, several dozen times a second.
+ * It also marks the line as ours to clear — a stale "update this app" sitting
+ * over a transfer that then succeeds would be worse than never showing it.
+ */
+let verdictShown: string | null = null;
+
+/**
+ * A Decimen frame reached us, so the optical link works — retire the
+ * no-signal hint for good even if the frame itself was unusable, because its
+ * advice is about getting a frame at all.
+ */
+function linkProven() {
+  if (!noSignal.frameDecoded()) return;
+  noSignalToast.hidden = true;
+  // The dialog's premise ("nothing decoded") just became false mid-read.
+  if (noSignalDialog.open) noSignalDialog.close();
+}
+
 function onDecoded(bytes: Uint8Array, box?: SymbolBox, info?: SymbolInfo) {
   decodeTimes.push(performance.now());
   totalDecodes++;
   if (info?.tracked) trackedDecodes++;
   if (box) noteRegion(box, performance.now(), true, info);
   const parsed = parseFrame(bytes);
-  if (!parsed || done) return;
+  if (done) return;
+  if (!parsed) {
+    // A Decimen frame we cannot use is a different problem from no frames at
+    // all, and the no-signal advice ("hold steadier, more light") is actively
+    // misleading for it. Say the true thing instead — this is the error path
+    // the version field exists to make possible.
+    const message = frameVerdictMessage(classifyFrame(bytes));
+    if (message && message !== verdictShown) {
+      showError(message);
+      verdictShown = message;
+      linkProven();
+    }
+    return;
+  }
   const { header, block } = parsed;
-  if (noSignal.frameDecoded()) {
-    noSignalToast.hidden = true;
-    // The dialog's premise ("nothing decoded") just became false mid-read.
-    if (noSignalDialog.open) noSignalDialog.close();
+  linkProven();
+  // A frame we can actually read answers whatever the last complaint was.
+  if (verdictShown !== null) {
+    setStatus("");
+    verdictShown = null;
   }
   // streamIdentity() covers every header field that has to hold constant, not
   // just the session id — see the note on it in protocol.ts.
@@ -922,6 +992,7 @@ async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
       showSnippet(
         snippetText(file),
         `text in ${seconds.toFixed(1)} s · ${rate} KB/s · ${gzipNote}SHA-256 verified ✓`,
+        cfgAutoShow.checked,
       );
       return;
     }
@@ -948,42 +1019,23 @@ async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
     // thing that arrived, Save under it, "Receive another file", and the
     // Transfer summary panel last in its natural spot after #result.
     result.replaceChildren(heading, summary);
-    if (file.type.startsWith("image/")) {
-      const image = document.createElement("img");
-      image.className = "received";
-      image.alt = `Received file preview: ${file.name}`;
-      image.src = url;
-      result.append(image);
-    } else if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
-      const player = document.createElement(file.type.startsWith("video/") ? "video" : "audio");
-      player.className = "received";
-      player.controls = true;
-      player.preload = "metadata";
-      player.setAttribute("aria-label", `Received file: ${file.name}`);
-      // Inline, and never autoplay — the user taps play (which is also the
-      // gesture that lets it start with sound).
-      if (player instanceof HTMLVideoElement) player.playsInline = true;
-      const src = await servableMediaUrl(file, url);
-      if (src !== url) {
-        // AVFoundation has been seen bypassing service workers for media
-        // loads; if the cache path 404s, fall back to the blob rather than
-        // leaving a dead player.
-        player.addEventListener("error", () => { player.src = url; }, { once: true });
-      }
-      player.src = src;
-      result.append(player);
-    }
     const actions = document.createElement("div");
     actions.className = "note-actions";
     actions.append(download);
     const endActions = document.createElement("div");
     endActions.className = "note-actions pair";
     endActions.append(restartButton("Receive another file"));
-    // The received bytes sit in the Cache API so the media player can range
-    // over them (see servableMediaUrl) — which means they outlive the page.
-    // Offer the scrub right where the transfer ends.
-    if ("caches" in window) endActions.append(clearCacheButton());
+    if (isPreviewable(file.type)) {
+      // Saving is unaffected either way — `download` above hangs off the blob
+      // URL, which needs nothing on disk. Only the preview is in question.
+      result.append(
+        cfgAutoShow.checked
+          ? await previewElement(file, url)
+          : revealButton(file, url, endActions),
+      );
+    }
     result.append(actions, endActions);
+    await offerCacheClear(endActions);
     const support = supportLink();
     if (support) result.append(support);
   } catch (error) {
@@ -1005,14 +1057,108 @@ async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
   }
 }
 
-/** Deletes the received-media cache — the one thing Decimen persists (see
- *  servableMediaUrl). Handing the phone over shouldn't mean handing over the
- *  last transfer. A player still streaming from the cache falls back to its
- *  blob URL via the error listener wired in finish(). */
+/** Media types that put themselves on screen, and so are what the auto-show
+ *  setting governs. Everything else only ever offered a Save link — there is
+ *  nothing to suppress. */
+function isPreviewable(type: string): boolean {
+  return type.startsWith("image/") || type.startsWith("video/") || type.startsWith("audio/");
+}
+
+function mediaNoun(type: string): string {
+  if (type.startsWith("image/")) return "image";
+  if (type.startsWith("video/")) return "video";
+  return "audio";
+}
+
+/**
+ * Build the on-screen preview for a received file.
+ *
+ * Called only when the preview is actually going up — auto-show on, or the user
+ * tapped Show. That is not just tidiness: the video/audio path writes the file
+ * into the Cache API (see servableMediaUrl), which outlives the page, so it must
+ * never run for a file the user chose not to look at.
+ */
+async function previewElement(file: OpticalFile, blobUrl: string): Promise<HTMLElement> {
+  if (file.type.startsWith("image/")) {
+    const image = document.createElement("img");
+    image.className = "received";
+    image.alt = `Received file preview: ${file.name}`;
+    image.src = blobUrl;
+    return image;
+  }
+  const player = document.createElement(file.type.startsWith("video/") ? "video" : "audio");
+  player.className = "received";
+  player.controls = true;
+  player.preload = "metadata";
+  player.setAttribute("aria-label", `Received file: ${file.name}`);
+  // Inline, and never autoplay — the user taps play (which is also the gesture
+  // that lets it start with sound).
+  if (player instanceof HTMLVideoElement) player.playsInline = true;
+  const src = await servableMediaUrl(file, blobUrl);
+  if (src !== blobUrl) {
+    // AVFoundation has been seen bypassing service workers for media loads; if
+    // the cache path 404s, fall back to the blob rather than leaving a dead
+    // player.
+    player.addEventListener("error", () => { player.src = blobUrl; }, { once: true });
+  }
+  player.src = src;
+  return player;
+}
+
+/** Stand-in for a suppressed preview. The file has already arrived and already
+ *  verified; this only governs whether it puts itself on screen. */
+function revealButton(file: OpticalFile, blobUrl: string, endActions: HTMLElement): HTMLElement {
+  const holder = document.createElement("div");
+  holder.className = "note-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "text-button";
+  button.textContent = `Show ${mediaNoun(file.type)}`;
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    void previewElement(file, blobUrl).then(async (el) => {
+      holder.replaceWith(el);
+      // Revealing video or audio is what writes the cache, so the offer to
+      // clear it only becomes truthful now.
+      await offerCacheClear(endActions);
+    });
+  });
+  holder.append(button);
+  return holder;
+}
+
+/**
+ * Offer to clear the received-media cache, but only when something is in it.
+ *
+ * Only video and audio ever write there (see servableMediaUrl), and with
+ * auto-show off they may never write at all — so the old `"caches" in window`
+ * test put the button up after every transfer, including text and images,
+ * implying Decimen had kept something it hadn't. Idempotent, because revealing
+ * media later calls this again.
+ */
+async function offerCacheClear(endActions: HTMLElement) {
+  if (!("caches" in window)) return;
+  if (endActions.querySelector(".clear-cache")) return;
+  try {
+    // has() first: open() would create the very cache we are asking about.
+    if (!(await caches.has("received-media"))) return;
+    const cache = await caches.open("received-media");
+    if ((await cache.keys()).length === 0) return;
+  } catch {
+    return;
+  }
+  endActions.append(clearCacheButton());
+}
+
+/** Deletes the received-media cache — the one thing Decimen persists besides
+ *  the auto-show preference (see servableMediaUrl). Handing the phone over
+ *  shouldn't mean handing over the last transfer. A player still streaming from
+ *  the cache falls back to its blob URL via the error listener wired in
+ *  previewElement(). */
 function clearCacheButton(): HTMLButtonElement {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "secondary-button";
+  button.className = "secondary-button clear-cache";
   button.textContent = "Clear Decimen cache";
   button.addEventListener("click", () => {
     button.disabled = true;
@@ -1079,7 +1225,7 @@ function showNoSignalHint() {
 /** Nothing is persisted: the text lives here until the page is closed. The
  *  summary line mirrors the file path — run stats under the heading, not up
  *  in the camera status line. */
-function showSnippet(text: string, summaryLine: string) {
+function showSnippet(text: string, summaryLine: string, reveal: boolean) {
   const heading = document.createElement("div");
   heading.className = "done";
   heading.textContent = "Text received";
@@ -1107,9 +1253,34 @@ function showSnippet(text: string, summaryLine: string) {
       copy.textContent = "Copy failed";
     }
   });
-  actions.append(copy, restartButton("Receive another file"));
+  actions.append(copy);
 
-  result.replaceChildren(heading, summary, body, actions);
+  // Same shape as the file path: primary action on its own row, end actions
+  // paired below. A snippet never writes to the cache itself, but an earlier
+  // video in this session may have — and until now the scrub was unreachable
+  // from here, so receiving text after a video left the video sitting there.
+  const endActions = document.createElement("div");
+  endActions.className = "note-actions pair";
+  endActions.append(restartButton("Receive another file"));
+  void offerCacheClear(endActions);
+
+  if (reveal) {
+    result.replaceChildren(heading, summary, body, actions, endActions);
+    return;
+  }
+  // Text is covered by the same setting as media, and for the same reason: a
+  // pasted password or address is exactly what someone who turned this off did
+  // not want appearing on a screen they may be holding up to someone. Copy
+  // still works — copying is not showing.
+  const holder = document.createElement("div");
+  holder.className = "note-actions";
+  const show = document.createElement("button");
+  show.type = "button";
+  show.className = "text-button";
+  show.textContent = "Show text";
+  show.addEventListener("click", () => holder.replaceWith(body));
+  holder.append(show);
+  result.replaceChildren(heading, summary, holder, actions, endActions);
 }
 
 function updateStats() {

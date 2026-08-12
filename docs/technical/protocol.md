@@ -12,7 +12,22 @@ Sender and receiver must build **bit-identical** soliton distributions, and JS e
 
 ## Frames are self-describing
 
-A 20-byte header carries session id, sequence number, block count/size, total length, and a payload hash. No handshake: the receiver locks onto a stream mid-flight, and restarting the sender (new session id) resets the receiver automatically. Stream identity covers *every* header field that must hold constant, not just the session id.
+A 22-byte header carries a wire-format version, feature flags, session id, sequence number, block count/size, total length, and a payload hash. No handshake: the receiver locks onto a stream mid-flight, and restarting the sender (new session id) resets the receiver automatically. Stream identity covers *every* header field that must hold constant, not just the session id.
+
+### Version and flags
+
+```
+0  u8   magic 0xD1   ┐ together: "this is a Decimen frame at all"
+1  u8   magic 0xC3   ┘ fixed for every version from v3 on
+2  u8   version      gates parsing wholesale — 3
+3  u8   flags        0x0F must-understand · 0xF0 safe to ignore
+4  u16  sessionId    6  u32 seq      10 u16 k        12 u16 blockLen
+14 u32  totalLen     18 u32 payloadFnv
+```
+
+Two magic bytes answer "is this ours" *before* any version is named — a receiver that guesses wrong tells the user to update a device that has never run Decimen, and that message latches on screen. `version` then gates parsing wholesale, and a receiver that meets one it does not know **says so** rather than showing nothing. `flags` splits into a must-understand half and a safe-to-ignore half, so a later feature costs a bit rather than another break.
+
+The rules, the reasoning, and the release compatibility table live in **[versioning](versioning.md)**; the bytes a second implementation is held to live in **[golden vectors](golden-vectors.md)**. Those two are the contract — this page is the overview.
 
 ## Container
 
