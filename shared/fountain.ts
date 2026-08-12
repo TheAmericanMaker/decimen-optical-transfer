@@ -167,8 +167,9 @@ function repairIndices(k: number, sessionId: number, seq: number): number[] {
  * Repair frames seed from the ABSOLUTE seq, so every cycle's repair frames
  * draw different subsets — re-watching the carousel never replays them.
  *
- * This is wire format v2 (frame header magic 0x0D). The v1 soliton stream
- * (frameIndices, solitonCdf, dlog) is kept above, pinned by its golden
+ * This carousel arrived with wire v2 and is unchanged in v3 — that break
+ * moved header bytes, not the fountain (see protocol.ts). The v1 soliton
+ * stream (frameIndices, solitonCdf, dlog) is kept above, pinned by its golden
  * vectors, in case a future format wants it back — it is no longer emitted.
  */
 export function frameComposition(k: number, sessionId: number, seq: number): number[] {

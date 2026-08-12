@@ -2,19 +2,115 @@
 // handshake — the receiver locks onto a stream mid-flight, and a new session
 // id on any frame simply starts a fresh transfer.
 //
-// Layout (little-endian), 20 bytes, followed by `blockLen` payload bytes:
-//   0  u8   magic 0xD1
-//   1  u8   magic 0x0D — wire format v2: systematic-carousel fountain
-//                        (bumped from 0x0C so v1 senders/receivers reject
-//                        v2 streams cleanly instead of desyncing silently)
-//   2  u16  sessionId   random per sender start
-//   4  u32  seq         drives the fountain PRNG (see fountain.ts)
-//   8  u16  k           source block count
-//  10  u16  blockLen    payload bytes per frame
-//  12  u32  totalLen    protected file-container length in bytes
-//  16  u32  payloadFnv  FNV-1a of the whole container — verified on completion
+// Layout (little-endian), 22 bytes, followed by `blockLen` payload bytes:
+//   0  u8   magic 0xD1  ┐ together: "this is a Decimen frame at all"
+//   1  u8   magic 0xC3  ┘ magic1 is fixed forever; 0x0C/0x0D mark v1/v2
+//   2  u8   version     wire format version — 3 (see WIRE_VERSION)
+//   3  u8   flags       feature bits WITHIN a version (see FLAG_*)
+//   4  u16  sessionId   random per sender start
+//   6  u32  seq         drives the fountain PRNG (see fountain.ts)
+//  10  u16  k           source block count
+//  12  u16  blockLen    payload bytes per frame
+//  14  u32  totalLen    protected file-container length in bytes
+//  18  u32  payloadFnv  FNV-1a of the whole container — verified on completion
+//
+// Why bytes 0–3 look like this (v2 → v3, the whole point of this format break):
+//
+// v1 → v2 spent a break on the magic bump 0x0C → 0x0D and bought no version
+// field with it. `parseFrame` returned null on an unknown magic and the
+// receiver silently did nothing, so a version-mismatched stream looked
+// identical to bad lighting. That is survivable for a PWA, which reconverges
+// on a service-worker refresh within days of a release. It is NOT survivable
+// once store binaries are in the field: those update on the user's schedule,
+// weeks or never, and a silent break strands real installs.
+//
+// So, from v3 on:
+//
+//   - TWO magic bytes answer "is this ours at all", and they answer it BEFORE
+//     anything is said about versions. One byte is not enough to speak on: with
+//     a lone 0xD1 gate, ~1 binary QR payload in 256 falls through to the
+//     version branches and gets told to update a device that has never run
+//     Decimen — and that advice latches (see verdictShown in receive/main.ts),
+//     so a wrong guess stays on screen until a real frame clears it. 16 bits of
+//     magic is what makes the verdicts below trustworthy enough to show a user.
+//   - `version` (byte 2) gates parsing wholesale, and a receiver that does not
+//     recognise it says so out loud (classifyFrame → frameVerdictMessage).
+//     0x0C and 0x0D stay reserved as MAGIC1 values forever, precisely so a v3
+//     receiver can name a v1/v2 sender instead of shrugging at it.
+//   - `flags` (byte 3) gates orthogonal features within a version, split into
+//     must-understand and ignorable halves (see CRITICAL_FLAGS). That split has
+//     to ship with the first versioned build: a receiver that treats every
+//     unknown bit as fatal cannot be taught otherwise without another format
+//     break, so "some bits are safe to ignore" is not a rule that can be added
+//     later — only declared now.
+//
+// There is deliberately NO reserved byte. An earlier draft of v3 kept one and
+// spent magic1 to pay for it, which had it backwards: a reserved byte only
+// duplicates what a must-understand flag bit already does (and four of those is
+// more headroom than this format will ever need), while magic1 duplicates
+// nothing. Worse, that draft classified a nonzero reserved byte as `malformed`,
+// which is silent — so the one mechanism it was spent on could never have been
+// used without reintroducing the exact failure v3 exists to abolish.
+//
+// Deployed v2 receivers match byte 1 against 0x0D exactly, so they reject v3
+// frames on the magic check rather than misparsing a header whose fields have
+// all moved.
 
-export const HEADER_LEN = 20;
+export const HEADER_LEN = 22;
+
+const MAGIC0 = 0xd1;
+/**
+ * Second magic byte. Fixed for every version from v3 on — the version lives in
+ * byte 2 now, so this one never has to move again.
+ */
+const MAGIC1 = 0xc3;
+
+/**
+ * Byte-1 values of the pre-versioning formats, reserved forever so a receiver
+ * can tell "older sender" from "not a Decimen frame at all". These are magic1
+ * values, not version numbers: v1 and v2 never carried a version field, and 1
+ * and 2 have never appeared on the wire as bytes.
+ */
+const LEGACY_MAGIC1 = new Map<number, number>([
+  [0x0c, 1],
+  [0x0d, 2],
+]);
+
+/**
+ * Wire format version this build speaks, carried in byte 2 of every frame.
+ *
+ * A u8, with 0 reserved as "ours, but no such version" — 254 generations after
+ * this one. Not a constraint worth designing around; the point is that the next
+ * break is a number, not a break.
+ */
+export const WIRE_VERSION = 3;
+
+/**
+ * Flag bits a receiver MUST understand to decode the payload at all; an unknown
+ * one here is a loud reject.
+ *
+ * The complement (0xF0) is the ignorable half — bits a future sender may set to
+ * describe a stream this build decodes correctly anyway. Nothing sets them yet,
+ * and that is fine: what ships with v3 is the *rule*, because a receiver that
+ * has already been told "every unknown bit is fatal" can only be corrected by
+ * another format break. See streamIdentity(), which excludes them for the same
+ * reason.
+ */
+export const CRITICAL_FLAGS = 0x0f;
+
+/**
+ * Payload is an encrypted container. Critical — a receiver that cannot decrypt
+ * must not pretend it decoded — and deliberately NOT in SUPPORTED_FLAGS: this
+ * build never sets it and must refuse streams that do, with a message rather
+ * than silence. Claiming the bit now is what makes encryption a flag later
+ * instead of wire v4.
+ */
+export const FLAG_ENCRYPTED = 0x01;
+
+/**
+ * Critical flag bits this build can actually honour — currently none.
+ */
+const SUPPORTED_FLAGS = 0x00;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 /**
  * One place for the number, so the picker label, the rejection message and
@@ -26,8 +122,6 @@ export const MAX_FILE_BYTES = 64 * 1024 * 1024;
  */
 export const MAX_FILE_LABEL = `${MAX_FILE_BYTES / 1024 / 1024} MB`;
 const FILE_HEADER_LEN = 49;
-const MAGIC0 = 0xd1;
-const MAGIC1 = 0x0d; // v2: systematic-carousel fountain (see fountain.ts)
 const FILE_MAGIC = new Uint8Array([0x44, 0x43, 0x46, 0x32]); // DCF2
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -278,39 +372,127 @@ export interface FrameHeader {
   blockLen: number;
   totalLen: number;
   payloadFnv: number;
+  /**
+   * Feature bits (see FLAG_* and CRITICAL_FLAGS). Required, not optional: the
+   * wire always carries this byte, so every construction site should have to
+   * say what goes in it rather than silently inheriting a default it never
+   * considered. Nothing this build sends sets any bit — they are all 0.
+   */
+  flags: number;
 }
+
+/**
+ * Why a frame did not parse — the difference between "point the camera
+ * somewhere else" and "one of these two devices needs an update".
+ *
+ * `foreign` is the silent case on purpose: the receiver decodes every QR code
+ * in view, including shop-window ones, and narrating those would be noise.
+ * Every other non-ok verdict has something true and actionable to say, which
+ * is the part v2 could not express.
+ */
+export type FrameVerdict =
+  | { kind: "ok" }
+  | { kind: "foreign" }
+  | { kind: "older-sender"; version: number }
+  | { kind: "newer-sender"; version: number }
+  | { kind: "unsupported-flags"; flags: number }
+  | { kind: "malformed" };
 
 export function packFrame(h: FrameHeader, block: Uint8Array): Uint8Array {
   const out = new Uint8Array(HEADER_LEN + block.length);
   const dv = new DataView(out.buffer);
   dv.setUint8(0, MAGIC0);
   dv.setUint8(1, MAGIC1);
-  dv.setUint16(2, h.sessionId, true);
-  dv.setUint32(4, h.seq, true);
-  dv.setUint16(8, h.k, true);
-  dv.setUint16(10, h.blockLen, true);
-  dv.setUint32(12, h.totalLen, true);
-  dv.setUint32(16, h.payloadFnv, true);
+  dv.setUint8(2, WIRE_VERSION);
+  dv.setUint8(3, h.flags);
+  dv.setUint16(4, h.sessionId, true);
+  dv.setUint32(6, h.seq, true);
+  dv.setUint16(10, h.k, true);
+  dv.setUint16(12, h.blockLen, true);
+  dv.setUint32(14, h.totalLen, true);
+  dv.setUint32(18, h.payloadFnv, true);
   out.set(block, HEADER_LEN);
   return out;
+}
+
+/**
+ * Single owner of "is this frame ours, and can we decode it?".
+ *
+ * parseFrame() delegates here so the yes/no answer and the reason for a no can
+ * never drift apart — the failure mode versioning is supposed to prevent.
+ */
+export function classifyFrame(bytes: Uint8Array): FrameVerdict {
+  // Needs bytes 0–3 before anything can be said about it.
+  if (bytes.length < 4 || bytes[0] !== MAGIC0) return { kind: "foreign" };
+  if (bytes[1] !== MAGIC1) {
+    // A pre-versioning sender put its format marker where magic1 now lives.
+    // Anything else this far in is not ours, and gets silence.
+    const legacy = LEGACY_MAGIC1.get(bytes[1]!);
+    return legacy === undefined
+      ? { kind: "foreign" }
+      : { kind: "older-sender", version: legacy };
+  }
+
+  // Past 16 bits of magic the frame is Decimen's, so every verdict below can
+  // name a version out loud without wondering whether it is really a stray QR
+  // code in the background. That confidence is the entire reason magic1 exists.
+  const version = bytes[2]!;
+  if (version === 0) return { kind: "malformed" }; // ours, but no such version
+  if (version !== WIRE_VERSION) {
+    return version > WIRE_VERSION
+      ? { kind: "newer-sender", version }
+      : { kind: "older-sender", version };
+  }
+
+  // Only the critical half is enforced. Ignorable bits are skipped on purpose:
+  // a future sender may use them to describe a stream this build decodes
+  // correctly regardless, and refusing those would make the ignorable half of
+  // the byte a lie. Report just the offending bits, not the whole byte.
+  const unknownCritical = bytes[3]! & CRITICAL_FLAGS & ~SUPPORTED_FLAGS;
+  if (unknownCritical !== 0) return { kind: "unsupported-flags", flags: unknownCritical };
+
+  if (bytes.length <= HEADER_LEN) return { kind: "malformed" };
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const k = dv.getUint16(10, true);
+  const blockLen = dv.getUint16(12, true);
+  const totalLen = dv.getUint32(14, true);
+  if (k === 0 || blockLen === 0 || totalLen === 0) return { kind: "malformed" };
+  if (bytes.length !== HEADER_LEN + blockLen) return { kind: "malformed" };
+  return { kind: "ok" };
+}
+
+/**
+ * What to put on screen for a verdict, or null when there is nothing worth
+ * saying. Lives beside the format rather than in the receiver's DOM code so
+ * every client — web, iOS, Android — words the same failure the same way.
+ */
+export function frameVerdictMessage(verdict: FrameVerdict): string | null {
+  switch (verdict.kind) {
+    case "older-sender":
+      return `That screen is sending an older Decimen format (v${verdict.version}). Update the sending device.`;
+    case "newer-sender":
+      return `That screen is sending a newer Decimen format (v${verdict.version}). Update this app to receive it.`;
+    case "unsupported-flags":
+      return "That stream uses a Decimen feature this version cannot read. Update this app to receive it.";
+    default:
+      return null;
+  }
 }
 
 export function parseFrame(
   bytes: Uint8Array,
 ): { header: FrameHeader; block: Uint8Array } | null {
-  if (bytes.length <= HEADER_LEN) return null;
-  if (bytes[0] !== MAGIC0 || bytes[1] !== MAGIC1) return null;
+  if (classifyFrame(bytes).kind !== "ok") return null;
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const header: FrameHeader = {
-    sessionId: dv.getUint16(2, true),
-    seq: dv.getUint32(4, true),
-    k: dv.getUint16(8, true),
-    blockLen: dv.getUint16(10, true),
-    totalLen: dv.getUint32(12, true),
-    payloadFnv: dv.getUint32(16, true),
+    sessionId: dv.getUint16(4, true),
+    seq: dv.getUint32(6, true),
+    k: dv.getUint16(10, true),
+    blockLen: dv.getUint16(12, true),
+    totalLen: dv.getUint32(14, true),
+    payloadFnv: dv.getUint32(18, true),
+    flags: dv.getUint8(3),
   };
-  if (header.k === 0 || header.blockLen === 0 || header.totalLen === 0) return null;
-  if (bytes.length !== HEADER_LEN + header.blockLen) return null;
   return { header, block: bytes.subarray(HEADER_LEN) };
 }
 
@@ -328,7 +510,12 @@ export function parseFrame(
  * k, sessionId and seq produce an identical frame.
  */
 export function streamIdentity(h: FrameHeader): string {
-  return `${h.sessionId}:${h.k}:${h.blockLen}:${h.totalLen}:${h.payloadFnv}`;
+  // Critical bits only. An ignorable bit that flips mid-stream must NOT reset
+  // the decoder — doing so would throw away every block recovered so far, which
+  // is strictly worse than rejecting the frame, and would mean the ignorable
+  // half of the flags byte was never ignorable at all.
+  const critical = h.flags & CRITICAL_FLAGS;
+  return `${h.sessionId}:${h.k}:${h.blockLen}:${h.totalLen}:${h.payloadFnv}:${critical}`;
 }
 
 export function fnv1a(bytes: Uint8Array): number {

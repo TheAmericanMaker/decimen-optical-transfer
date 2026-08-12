@@ -17,14 +17,18 @@ const OFFERED = FRAME_BYTES_OPTIONS;
 
 test("the header takes its cut off every frame", () => {
   assert.equal(blockLength(2953), 2953 - HEADER_LEN);
-  assert.equal(blockLength(500), 480);
+  assert.equal(blockLength(500), 500 - HEADER_LEN);
 });
 
 test("block count rounds up, because a partial block still needs a frame", () => {
+  // Derived from blockLength() rather than written out: these boundaries move
+  // whenever the header does, and a wire-format change should not look like a
+  // capacity bug.
+  const perFrame = blockLength(2953);
   assert.equal(sourceBlockCount(1, 2953), 1);
-  assert.equal(sourceBlockCount(2933, 2953), 1);
-  assert.equal(sourceBlockCount(2934, 2953), 2);
-  assert.equal(sourceBlockCount(10 * 2933, 2953), 10);
+  assert.equal(sourceBlockCount(perFrame, 2953), 1);
+  assert.equal(sourceBlockCount(perFrame + 1, 2953), 2);
+  assert.equal(sourceBlockCount(10 * perFrame, 2953), 10);
 });
 
 test("the block ceiling bites well below the file size limit", () => {
